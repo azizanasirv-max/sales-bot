@@ -9,7 +9,12 @@
     "preview": "vite preview",
     "start": "tsx server.ts",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "tsx --test tests/unit/*.test.ts tests/bridge-protocol.test.ts",
+    "test:unit": "tsx --test tests/unit/*.test.ts",
+    "test:bridge": "tsx --test tests/bridge-protocol.test.ts",
+    "test:live": "tsx tests/interruption-suite.ts",
+    "test:live-trials": "tsx tests/live-controlled-trials.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
