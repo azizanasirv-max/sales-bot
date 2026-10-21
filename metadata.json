@@ -1,0 +1,6 @@
+{
+  "name": "Gemini Live Voice Tester",
+  "description": "Technical prototype and diagnostics benchmark for testing real-time voice, low latency, and barge-in interruption with the gemini-3.8-live model.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
