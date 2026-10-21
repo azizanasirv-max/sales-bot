@@ -1,4 +1,7 @@
 import WebSocket from 'ws';
+const MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.8-live';
+import { ConversationGate } from '../src/lib/conversation';
+import { buildDiagnosticsReport } from '../src/lib/diagnostics';
 
 interface TestResult {
   name: string;
@@ -16,19 +19,34 @@ function assert(condition: boolean, msg: string) {
 async function runSuite() {
   console.log('=== STARTING REPEATABLE INTERRUPTION & PIPELINE REGRESSION SUITE ===\n');
 
+  // Precondition: these tests exercise the real Gemini Live API. Without a key
+  // they would fail with API_KEY_MISSING, which says nothing about the code.
+  const apiKey = process.env.GEMINI_API_KEY || '';
+  try {
+    const statusRes = await fetch('http://localhost:3000/api/status');
+    const status = await statusRes.json();
+    if (!status.hasServerKey && !apiKey) {
+      console.log('SKIPPED: no GEMINI_API_KEY (server env or shell). Live suite not executed.');
+      process.exit(0);
+    }
+  } catch {
+    console.error('ERROR: bridge server is not running on http://localhost:3000 (npm run dev).');
+    process.exit(2);
+  }
+
   // TEST 1: Session Isolation & Clean Initialization
   try {
     const t0 = performance.now();
     const ws1 = new WebSocket('ws://localhost:3000/api/live-ws');
     await new Promise<void>((resolve, reject) => {
       ws1.on('open', () => {
-        ws1.send(JSON.stringify({ type: 'start', model: 'gemini-3.8-live' }));
+        ws1.send(JSON.stringify({ type: 'start', model: MODEL, apiKey: apiKey || undefined }));
       });
       ws1.on('message', (raw) => {
         const msg = JSON.parse(raw.toString());
         if (msg.type === 'session_ready') {
           assert(typeof msg.sessionId === 'string' && msg.sessionId.startsWith('sess_'), 'Session ID missing or malformed');
-          assert(msg.model === 'gemini-3.8-live', 'Model must be gemini-3.8-live');
+          assert(msg.model === MODEL, 'Model must be gemini-3.8-live');
           ws1.send(JSON.stringify({ type: 'end' }));
         }
         if (msg.type === 'status' && msg.state === 'disconnected') {
@@ -44,7 +62,7 @@ async function runSuite() {
     const ws2 = new WebSocket('ws://localhost:3000/api/live-ws');
     await new Promise<void>((resolve, reject) => {
       ws2.on('open', () => {
-        ws2.send(JSON.stringify({ type: 'start', model: 'gemini-3.8-live' }));
+        ws2.send(JSON.stringify({ type: 'start', model: MODEL, apiKey: apiKey || undefined }));
       });
       ws2.on('message', (raw) => {
         const msg = JSON.parse(raw.toString());
@@ -119,7 +137,7 @@ async function runSuite() {
     const ws = new WebSocket('ws://localhost:3000/api/live-ws');
     await new Promise<void>((resolve, reject) => {
       ws.on('open', () => {
-        ws.send(JSON.stringify({ type: 'start', model: 'gemini-3.8-live' }));
+        ws.send(JSON.stringify({ type: 'start', model: MODEL, apiKey: apiKey || undefined }));
       });
       ws.on('message', (raw) => {
         const msg = JSON.parse(raw.toString());
@@ -166,36 +184,36 @@ async function runSuite() {
     });
   }
 
-  // TEST 4: Generation Tracking & Invalidation on Interruption
+  // TEST 4: Generation Tracking & Invalidation on Interruption (real gate)
   try {
     const t0 = performance.now();
-    // Simulate generation tagging & invalidation contract
-    let activeGen = 'gen_1';
-    const invalidatedGens = new Set<string>();
+    const gate = new ConversationGate();
 
-    // Simulated interruption event
-    const handleInterruption = (interruptedGen: string, nextGen: string) => {
-      invalidatedGens.add(interruptedGen);
-      activeGen = nextGen;
-    };
+    // Interrupted response must be dropped, the next response accepted.
+    gate.acceptAudio('gen_1');
+    gate.markPlaybackScheduled('gen_1');
+    gate.handleInterruption('gen_1', 'gen_2');
+    assert(!gate.acceptAudio('gen_1').accepted, 'Chunk from gen_1 must be dropped after interruption');
+    assert(gate.acceptAudio('gen_2').accepted, 'Chunk from gen_2 must be accepted');
 
-    handleInterruption('gen_1', 'gen_2');
+    // A late interruption event for an older generation must not rewind state.
+    gate.handleInterruption('gen_1', 'gen_2');
+    gate.acceptAudio('gen_2');
+    assert(gate.getActiveGenerationId() === 'gen_2', 'Stale interruption must not rewind the generation');
 
-    // Chunks from gen_1 must be dropped
-    const isChunkValid = (genId: string) => !invalidatedGens.has(genId) && genId === activeGen;
-
-    assert(!isChunkValid('gen_1'), 'Chunk from gen_1 must be dropped after interruption');
-    assert(isChunkValid('gen_2'), 'Chunk from gen_2 must be accepted');
-
-    // Rapid successive interruption
-    handleInterruption('gen_2', 'gen_3');
-    assert(!isChunkValid('gen_2'), 'Chunk from gen_2 must be dropped');
-    assert(isChunkValid('gen_3'), 'Chunk from gen_3 must be accepted');
+    // Barge-in after turn_complete: pending answer must survive.
+    const gate2 = new ConversationGate();
+    gate2.acceptAudio('gen_1');
+    gate2.markPlaybackScheduled('gen_1');
+    gate2.handleTurnComplete('gen_1', 'gen_2');
+    gate2.localBargeIn();
+    assert(!gate2.isInvalidated('gen_2'), 'Pending next generation must not be invalidated on barge-in');
+    assert(gate2.acceptAudio('gen_2').accepted, 'Answer to the barge-in must be accepted');
 
     results.push({
       name: '4. Generation ID Monotonic Tracking & Stale Chunk Rejection',
       passed: true,
-      details: 'Invalidated generations strictly blocked from scheduling; active generation advanced cleanly.',
+      details: 'Real ConversationGate drops interrupted/stale chunks and preserves the pending next generation.',
       durationMs: Math.round(performance.now() - t0),
     });
   } catch (err: any) {
@@ -214,7 +232,7 @@ async function runSuite() {
       let chunksSent = 0;
 
       ws.on('open', () => {
-        ws.send(JSON.stringify({ type: 'start', model: 'gemini-3.8-live' }));
+        ws.send(JSON.stringify({ type: 'start', model: MODEL, apiKey: apiKey || undefined }));
       });
 
       ws.on('message', (raw) => {
@@ -266,7 +284,7 @@ async function runSuite() {
       data.quotaStatus === 'Remaining account quota is not exposed by this session API.',
       'Explicit quota notice required'
     );
-    assert(data.targetModel === 'gemini-3.8-live', 'Model target must be gemini-3.8-live');
+    assert(data.targetModel === MODEL, 'Model target must be gemini-3.8-live');
 
     results.push({
       name: '6. Quota Notice & Usage Metadata Semantics',
@@ -286,14 +304,22 @@ async function runSuite() {
   try {
     const t0 = performance.now();
     const rawApiKey = 'AIzaSyFakeKeyForTest1234567890';
-    // Verify client diagnostics export format
-    const sampleExport = {
-      modelId: 'gemini-3.8-live',
-      hasConfiguredApiKey: true,
-      authSource: 'user_provided_key',
-      recentEvents: [{ type: 'info', message: 'User configured Gemini API key in session storage.' }],
-    };
-    const jsonStr = JSON.stringify(sampleExport);
+    // Exercise the real export builder with a key present in the surrounding
+    // state; it must only emit whitelisted fields.
+    const jsonStr = JSON.stringify(
+      buildDiagnosticsReport({
+        modelId: MODEL,
+        sessionDiagnostics: { sessionId: 'sess_test' },
+        activeGenerationId: 'gen_0',
+        language: 'Auto',
+        hasConfiguredApiKey: true,
+        authSource: 'user_provided_key',
+        microphoneDevice: 'Test Mic',
+        recentEvents: [{ type: 'info', message: 'User configured Gemini API key in session storage.' }],
+        // @ts-expect-error verifying that extra fields are dropped
+        apiKey: rawApiKey,
+      })
+    );
     assert(!jsonStr.includes(rawApiKey), 'Raw API key must never appear in export');
     assert(jsonStr.includes('user_provided_key'), 'Auth source status must be visible');
 

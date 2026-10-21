@@ -1,3 +1,4 @@
+const MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.8-live';
 import fs from 'fs';
 import WebSocket from 'ws';
 
@@ -58,7 +59,20 @@ interface LiveTrialResult {
 }
 
 async function runLiveTrials() {
-  console.log('=== RUNNING CONTROLLED EXPERIMENTS AGAINST REAL GEMINI LIVE API (gemini-3.8-live) ===\n');
+  console.log(`=== RUNNING CONTROLLED EXPERIMENTS AGAINST REAL GEMINI LIVE API (${MODEL}) ===\n`);
+
+  const apiKey = process.env.GEMINI_API_KEY || '';
+  try {
+    const statusRes = await fetch('http://localhost:3000/api/status');
+    const status = await statusRes.json();
+    if (!status.hasServerKey && !apiKey) {
+      console.log('SKIPPED: no GEMINI_API_KEY (server env or shell). Live trials not executed.');
+      return;
+    }
+  } catch {
+    console.error('ERROR: bridge server is not running on http://localhost:3000 (npm run dev).');
+    process.exit(2);
+  }
 
   const promptChunks = loadWavAndResampleTo16k('tests/prompt.wav');
   const interruptChunks = loadWavAndResampleTo16k('tests/interrupt.wav');
@@ -153,7 +167,7 @@ function executeSingleTrial(
     let seq = 0;
 
     ws.on('open', () => {
-      ws.send(JSON.stringify({ type: 'start', model: 'gemini-3.8-live' }));
+      ws.send(JSON.stringify({ type: 'start', model: MODEL, apiKey: process.env.GEMINI_API_KEY || undefined }));
     });
 
     ws.on('message', (raw) => {
