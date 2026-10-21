@@ -37,11 +37,12 @@ Key files:
 ## Conversation flow
 
 1. The user selects voice **and conversation language**, then presses *Start*.
-2. `startConversation` acquires the microphone, creates 16 kHz input/output
-   `AudioContext`s and opens the bridge WebSocket.
+2. `startConversation` acquires the microphone, creates a 16 kHz input
+   `AudioContext` (falling back to the hardware rate) and an output
+   `AudioContext` at the hardware rate, then opens the bridge WebSocket.
 3. The bridge validates the model/API key, opens a Gemini Live session with the
-   language policy, `speechConfig.languageCode` (when locked) and a sliding
-   context window, then reports `session_ready` with the **server's** session ID.
+   language policy, a sliding context window and session-resumption updates,
+   then reports `session_ready` with the **server's** session ID.
 4. Microphone chunks are forwarded with `sendRealtimeInput`; the server drops
    chunks while no Live context is active (connecting/reconnecting).
 5. Model audio is tagged with a **generation ID**. The client's
@@ -55,19 +56,22 @@ Key files:
 8. On transport loss after a ready session the bridge resumes the Live session
    with its resumption handle (max 2 attempts). The client keeps its audio graph,
    history and language; if resumption is impossible the session fails closed
+   instead of silently starting a context-less session.
 
 ## Language consistency
 
-Two levers are applied together:
+`gemini-3.8-live` is a native-audio model. Google's Live API documentation
+states that native-audio models choose the language themselves and *do not
+support explicitly setting the language code*, so this application applies the
+supported lever: a highest-priority language policy appended to the system
+instruction that forbids switching on interruptions or noisy transcripts.
+`speechConfig.languageCode` is only added when `GEMINI_LIVE_MODEL` points at a
+legacy half-cascade Live model where that field is documented as supported.
 
-* `speechConfig.languageCode` (e.g. `en-US`) when the user locks a language.
-* A highest-priority language policy appended to the system instruction that
-  forbids switching on interruptions or noisy transcripts.
-
-`Auto (follow the user)` omits `languageCode` and instructs the model to detect
-the first intelligible language and keep it. The preference is persisted in
-`localStorage`, is part of the session diagnostics/export, and is never reset by
-interruption recovery or session resumption.
+`Auto (follow the user)` instructs the model to detect the first intelligible
+language and keep it. The preference is persisted in `localStorage`, is part of
+the session diagnostics/export, and is never reset by interruption recovery or
+session resumption.
 
 Model compliance is ultimately empirical: an instruction cannot *guarantee*
 behaviour, which is why the retest checklist below verifies it over many turns.
@@ -78,6 +82,8 @@ behaviour, which is why the retest checklist below verifies it over many turns.
 | --- | --- | --- |
 | `GEMINI_API_KEY` | Yes* | Server-side API key. If absent, the user supplies a key in the UI (session storage only). |
 | `GEMINI_LIVE_MODEL` | No | Overrides the default model ID `gemini-3.8-live`. `/api/status` reports the resolved value. |
+| `LIVE_CONNECT_TIMEOUT_MS` | No | Deadline for opening a Live session (default `20000`). |
+| `ALLOWED_ORIGINS` | No | Comma-separated extra browser origins permitted to open the bridge WebSocket. Same-host and `APP_URL` are always allowed. |
 | `PORT` | No | HTTP/WebSocket port (default `3000`). |
 | `APP_URL` | In AI Studio | Injected by AI Studio for self-referential links. |
 
@@ -89,10 +95,11 @@ diagnostics export.
 ## Commands
 
 ```bash
-npm install          # or: bun install
+npm install          # or: bun install (bun.lock is the canonical lockfile)
 npm run dev          # bridge + Vite dev middleware on :3000
 npm run lint         # tsc --noEmit
 npm run build        # production client build
+npm run start:prod   # serve dist/ + bridge (NODE_ENV=production)
 npm test             # offline unit + bridge protocol tests
 npm run test:unit    # language / interruption / ordering unit tests
 npm run test:bridge  # real server, no API key required
@@ -144,5 +151,3 @@ consistent, no broken state (context compression keeps the session alive).
 **Test F — Recovery.** If the environment can interrupt the network, force a
 transport drop. Pass: session resumes with context (or fails closed with a clear
 error), no stale responses, no duplicate turns.
-
-   instead of silently starting a context-less session.

@@ -6,6 +6,8 @@ import {
   buildLanguageInstruction,
   composeSystemInstruction,
   resolveLanguagePreference,
+  resolvePlaybackStopSet,
+  shouldTriggerLocalBargeIn,
 } from '../../src/lib/conversation';
 
 test('language: empty/invalid values fall back to auto (never a broken API tag)', () => {
@@ -151,6 +153,85 @@ test('gate: a local barge-in followed by the server interruption dedupes invalid
   assert.deepEqual(serverEvent.invalidated, []);
   assert.equal(serverEvent.firstObservation, false);
   assert.equal(gate.acceptAudio('gen_8').accepted, true);
+});
+
+test('gate: an untagged chunk cannot resurrect an invalidated generation', () => {
+  const gate = new ConversationGate();
+  gate.acceptAudio('gen_2');
+  gate.markPlaybackScheduled('gen_2');
+  gate.localBargeIn();
+  const result = gate.acceptAudio(undefined);
+  assert.equal(result.accepted, false);
+  assert.equal(result.reason, 'invalidated');
+  assert.equal(result.generationId, 'gen_2');
+});
+
+test('gate: a generation stays "playing" until all of its chunks have ended', () => {
+  const gate = new ConversationGate();
+  gate.acceptAudio('gen_9');
+  gate.markPlaybackScheduled('gen_9');
+  gate.markPlaybackScheduled('gen_9');
+  gate.markPlaybackScheduled('gen_9');
+  assert.equal(gate.playbackCount(), 1);
+
+  // One 32ms buffer ending must not make a multi-second response look silent.
+  gate.markPlaybackEnded('gen_9');
+  assert.equal(gate.isPlaying('gen_9'), true);
+  assert.deepEqual(gate.localBargeIn().invalidated, ['gen_9']);
+
+  // And once every chunk has ended there is nothing left to cancel.
+  const gate2 = new ConversationGate();
+  gate2.acceptAudio('gen_3');
+  gate2.markPlaybackScheduled('gen_3');
+  gate2.markPlaybackScheduled('gen_3');
+  gate2.markPlaybackEnded('gen_3');
+  assert.equal(gate2.isPlaying('gen_3'), true);
+  gate2.markPlaybackEnded('gen_3');
+  assert.equal(gate2.isPlaying('gen_3'), false);
+  assert.equal(gate2.playbackCount(), 0);
+});
+
+test('gate: teardown also invalidates a pending active generation', () => {
+  const gate = new ConversationGate();
+  gate.acceptAudio('gen_1');
+  gate.handleTurnComplete('gen_1', 'gen_2'); // gen_2 is pending, no audio yet
+  gate.invalidateAll();
+  assert.equal(gate.isInvalidated('gen_2'), true);
+  assert.equal(gate.acceptAudio('gen_2').accepted, false);
+});
+
+test('cancellation: only invalidated generations are stopped, except on cleanup', () => {
+  const scheduled = ['gen_1', 'gen_2'];
+
+  // A late interruption for gen_1 must not truncate the already-scheduled
+  // answer in gen_2.
+  assert.deepEqual([...resolvePlaybackStopSet('server_interrupted', ['gen_1'], scheduled)], [
+    'gen_1',
+  ]);
+  assert.deepEqual([...resolvePlaybackStopSet('local_onset', ['gen_1'], scheduled)], ['gen_1']);
+  assert.deepEqual([...resolvePlaybackStopSet('session_cleanup', [], scheduled)], [
+    'gen_1',
+    'gen_2',
+  ]);
+});
+
+test('barge-in: the tail of the interrupting utterance cannot cancel the answer', () => {
+  const base = {
+    isSpeaking: true,
+    speechFrameCount: 3,
+    playbackCount: 1,
+    alreadyCancelled: false,
+    suppressedUntilSilence: false,
+  };
+  assert.equal(shouldTriggerLocalBargeIn(base), true);
+  // Same utterance, before any pause: suppressed.
+  assert.equal(shouldTriggerLocalBargeIn({ ...base, suppressedUntilSilence: true }), false);
+  // Already cancelled for this turn.
+  assert.equal(shouldTriggerLocalBargeIn({ ...base, alreadyCancelled: true }), false);
+  // Speech but no audio playing: nothing to cancel.
+  assert.equal(shouldTriggerLocalBargeIn({ ...base, playbackCount: 0 }), false);
+  // Onset debounce.
+  assert.equal(shouldTriggerLocalBargeIn({ ...base, speechFrameCount: 2 }), false);
 });
 
 test('gate: reset isolates a new session from the previous invalidation set', () => {

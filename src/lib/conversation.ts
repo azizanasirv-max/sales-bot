@@ -104,8 +104,11 @@ export function resolveLanguagePreference(requested?: string | null): LanguagePr
  * Builds the language policy appended to the system instruction.
  *
  * IMPORTANT: an application-side instruction steers the model but cannot
- * *guarantee* compliance. The speechConfig.languageCode (added by the server
- * when a language is locked) is the second, stronger lever. Both are used.
+ * *guarantee* compliance. For native-audio models (the default here) this is
+ * the only supported language lever: Google documents that native-audio output
+ * models choose the language themselves and do not support an explicit
+ * `speechConfig.languageCode`. That field is only sent for legacy half-cascade
+ * models where it is supported.
  */
 export function buildLanguageInstruction(language: LanguagePreference): string {
   if (language.code) {
@@ -171,6 +174,17 @@ export class ConversationGate {
   private invalidatedGenerations = new Set<string>();
   private generationsWithAudio = new Set<string>();
   private playingGenerations = new Set<string>();
+  /**
+   * Number of scheduled-but-not-finished sources per generation.
+   *
+   * A generation is only "playing" while at least one of its chunks is still
+   * audible. The previous implementation removed the generation from
+   * `playingGenerations` on the *first* `markPlaybackEnded`, so a response
+   * comprising many ~32 ms buffers appeared to stop playing after the first
+   * buffer ended. That made local barge-in detection unreliable for the rest
+   * of the response.
+   */
+  private playbackSourceCounts = new Map<string, number>();
   private pendingGenerationIds = new Set<string>();
   private activeGenerationId = INITIAL_GENERATION_ID;
 
@@ -178,6 +192,7 @@ export class ConversationGate {
     this.invalidatedGenerations.clear();
     this.generationsWithAudio.clear();
     this.playingGenerations.clear();
+    this.playbackSourceCounts.clear();
     this.pendingGenerationIds.clear();
     this.activeGenerationId = INITIAL_GENERATION_ID;
   }
@@ -240,9 +255,13 @@ export class ConversationGate {
    */
   acceptAudio(generationId?: string | null): AudioAcceptance {
     if (!generationId) {
-      // Legacy/unspecified generation: accept, the server tags every chunk we
-      // receive today so this only matters for forward compatibility.
-      return { accepted: true, generationId: this.activeGenerationId };
+      // Legacy/unspecified generation: attribute it to the active generation,
+      // but never resurrect a generation that was already invalidated.
+      const active = this.activeGenerationId;
+      if (this.invalidatedGenerations.has(active)) {
+        return { accepted: false, generationId: active, reason: 'invalidated' };
+      }
+      return { accepted: true, generationId: active };
     }
     if (this.invalidatedGenerations.has(generationId)) {
       return { accepted: false, generationId, reason: 'invalidated' };
@@ -263,9 +282,19 @@ export class ConversationGate {
     if (!generationId) return;
     this.generationsWithAudio.add(generationId);
     this.playingGenerations.add(generationId);
+    this.playbackSourceCounts.set(
+      generationId,
+      (this.playbackSourceCounts.get(generationId) ?? 0) + 1
+    );
   }
 
   markPlaybackEnded(generationId: string): void {
+    const remaining = (this.playbackSourceCounts.get(generationId) ?? 0) - 1;
+    if (remaining > 0) {
+      this.playbackSourceCounts.set(generationId, remaining);
+      return;
+    }
+    this.playbackSourceCounts.delete(generationId);
     this.playingGenerations.delete(generationId);
   }
 
@@ -273,6 +302,7 @@ export class ConversationGate {
     if (this.invalidatedGenerations.has(generationId)) return false;
     this.invalidatedGenerations.add(generationId);
     this.playingGenerations.delete(generationId);
+    this.playbackSourceCounts.delete(generationId);
     return true;
   }
 
@@ -291,6 +321,7 @@ export class ConversationGate {
       if (this.addInvalidated(generationId)) invalidated.push(generationId);
     }
     this.playingGenerations.clear();
+    this.playbackSourceCounts.clear();
 
     const active = this.activeGenerationId;
     const activeIsLiveResponse =
@@ -340,13 +371,15 @@ export class ConversationGate {
     for (const generationId of [...this.playingGenerations]) {
       if (this.addInvalidated(generationId)) invalidated.push(generationId);
     }
-    if (
-      this.generationsWithAudio.has(this.activeGenerationId) ||
-      this.playingGenerations.has(this.activeGenerationId)
-    ) {
-      if (this.addInvalidated(this.activeGenerationId)) invalidated.push(this.activeGenerationId);
+    // Invalidate the active generation even if it is still pending (a
+    // `turn_complete` may have advanced to a generation that has not produced
+    // audio yet). Otherwise a late chunk for it would be accepted after
+    // teardown.
+    if (this.addInvalidated(this.activeGenerationId)) {
+      invalidated.push(this.activeGenerationId);
     }
     this.playingGenerations.clear();
+    this.playbackSourceCounts.clear();
     return invalidated;
   }
 }
@@ -479,4 +512,60 @@ export class TurnLedger {
   private clone(turn: LedgerTurn): LedgerTurn {
     return { ...turn };
   }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Playback-cancellation and barge-in policy                                  */
+/* ------------------------------------------------------------------------- */
+
+export type CancellationReason = 'local_onset' | 'server_interrupted' | 'session_cleanup';
+
+/**
+ * Returns the generations whose scheduled audio must be stopped.
+ *
+ * - `session_cleanup` stops everything that was scheduled.
+ * - `local_onset` / `server_interrupted` stop exactly the generations that
+ *   were invalidated for that event. This matters when a newer generation has
+ *   already been scheduled (out-of-order delivery): cancelling the old
+ *   generation must not truncate the answer that replaced it.
+ */
+export function resolvePlaybackStopSet(
+  reason: CancellationReason,
+  invalidatedGenerations: readonly string[],
+  scheduledGenerations: readonly string[]
+): Set<string> {
+  if (reason === 'session_cleanup') return new Set(scheduledGenerations);
+  return new Set(invalidatedGenerations);
+}
+
+export interface LocalBargeInInput {
+  isSpeaking: boolean;
+  speechFrameCount: number;
+  playbackCount: number;
+  alreadyCancelled: boolean;
+  /**
+   * Set after a barge-in until the user has been silent for at least one
+   * analysis frame. Prevents the same continuous utterance from cancelling
+   * the model's *answer* as soon as its first chunk becomes audible.
+   */
+  suppressedUntilSilence: boolean;
+  onsetFrames?: number;
+}
+
+/**
+ * Decides whether microphone activity should locally stop playback.
+ *
+ * `alreadyCancelled` only re-arms at a turn boundary; `suppressedUntilSilence`
+ * additionally requires a pause, which is what prevents the answer to a
+ * barge-in from being cancelled by the tail of the interrupting utterance.
+ */
+export function shouldTriggerLocalBargeIn(input: LocalBargeInInput): boolean {
+  const onsetFrames = input.onsetFrames ?? 3;
+  return (
+    input.isSpeaking &&
+    input.speechFrameCount >= onsetFrames &&
+    input.playbackCount > 0 &&
+    !input.alreadyCancelled &&
+    !input.suppressedUntilSilence
+  );
 }

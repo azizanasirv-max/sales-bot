@@ -15,8 +15,13 @@ import {
   ConversationGate,
   SUPPORTED_LANGUAGES,
   TurnLedger,
+  resolvePlaybackStopSet,
+  shouldTriggerLocalBargeIn,
+  type CancellationReason,
   type LedgerTurn,
 } from './lib/conversation';
+import { loadStoredLanguage, storeLanguage } from './lib/languagePreference';
+import { buildDiagnosticsReport } from './lib/diagnostics';
 import {
   Key,
   Eye,
@@ -139,7 +144,12 @@ const PREBUILT_VOICES = ['Puck', 'Charon', 'Kore', 'Fenrir', 'Zephyr'] as const;
 export default function App() {
   // Credential configuration states
   const [apiKey, setApiKey] = useState<string>(() => {
-    return sessionStorage.getItem('GEMINI_LIVE_API_KEY') || '';
+    try {
+      return sessionStorage.getItem('GEMINI_LIVE_API_KEY') || '';
+    } catch {
+      // Storage can be disabled (private mode / embedded frame policy).
+      return '';
+    }
   });
   const [hasServerKey, setHasServerKey] = useState<boolean>(false);
   const [showKeyConfigModal, setShowKeyConfigModal] = useState<boolean>(false);
@@ -152,7 +162,10 @@ export default function App() {
   const [selectedVoice, setSelectedVoice] = useState<string>('Puck');
   const [selectedLanguage, setSelectedLanguage] = useState<string>(() => {
     try {
-      return localStorage.getItem('GEMINI_LIVE_LANGUAGE') || '';
+      return loadStoredLanguage(
+        window.localStorage,
+        SUPPORTED_LANGUAGES.map((option) => option.code)
+      );
     } catch {
       return '';
     }
@@ -203,9 +216,12 @@ export default function App() {
   // Generation ID tracking & invalidation
   const gateRef = useRef<ConversationGate>(new ConversationGate());
   const ledgerRef = useRef<TurnLedger>(new TurnLedger());
-  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const activeSourcesRef = useRef<
+    Array<{ node: AudioBufferSourceNode; generationId: string; endTime: number }>
+  >([]);
   const nextPlayTimeRef = useRef<number>(0);
   const isStartingRef = useRef<boolean>(false);
+  const pingIntervalRef = useRef<any>(null);
   const animFrameRef = useRef<number | null>(null);
 
   // Session ownership. `sessionEpochRef` invalidates handlers from a previous
@@ -222,6 +238,7 @@ export default function App() {
   const userSpeechOnsetMonoRef = useRef<number | null>(null);
   const lastInterruptionMonoRef = useRef<number | null>(null);
   const localCancellationFiredRef = useRef<boolean>(false);
+  const suppressBargeInUntilSilenceRef = useRef<boolean>(false);
   const chunkSequenceRef = useRef<number>(0);
 
   // Check iframe status on mount
@@ -342,7 +359,11 @@ export default function App() {
       setKeyError('Please enter a non-empty Google Gemini API key.');
       return;
     }
-    sessionStorage.setItem('GEMINI_LIVE_API_KEY', trimmed);
+    try {
+      sessionStorage.setItem('GEMINI_LIVE_API_KEY', trimmed);
+    } catch {
+      // The key still works in-memory for this tab.
+    }
     setApiKey(trimmed);
     setShowKeyConfigModal(false);
     setInputKey('');
@@ -354,7 +375,11 @@ export default function App() {
   };
 
   const handleClearApiKey = () => {
-    sessionStorage.removeItem('GEMINI_LIVE_API_KEY');
+    try {
+      sessionStorage.removeItem('GEMINI_LIVE_API_KEY');
+    } catch {
+      /* storage unavailable */
+    }
     setApiKey('');
     setShowKeyConfigModal(true);
     logEvent('info', 'User cleared configured API key.');
@@ -369,8 +394,7 @@ export default function App() {
     setSelectedLanguage(value);
     languageRef.current = value;
     try {
-      if (value) localStorage.setItem('GEMINI_LIVE_LANGUAGE', value);
-      else localStorage.removeItem('GEMINI_LIVE_LANGUAGE');
+      storeLanguage(window.localStorage, value);
     } catch {
       /* storage unavailable (private mode) */
     }
@@ -390,15 +414,22 @@ export default function App() {
    *  - local_onset:        only generations with audio actually playing plus
    *                        the active generation if it has already produced
    *                        audio (never the empty "next" generation).
-   *  - server_interrupted: exactly the generation the server reported.
+   *  - server_interrupted: exactly the generation the server reported (the
+   *                        caller passes the already-computed invalidated set,
+   *                        so the gate is not transitioned twice).
    *  - session_cleanup:    everything, and the gain map is emptied so a new
    *                        session cannot reuse GainNodes bound to a closed
    *                        AudioContext (which silently muted playback).
+   *
+   * Only sources belonging to an invalidated generation are stopped. A newer
+   * generation whose audio already arrived (out-of-order delivery) is left
+   * intact instead of being truncated by an older interruption event.
    */
   const cancelAllAssistantAudio = useCallback(
     (
-      reason: 'local_onset' | 'server_interrupted' | 'session_cleanup',
-      interruptedGenerationId?: string
+      reason: CancellationReason,
+      interruptedGenerationId?: string,
+      explicitInvalidated?: string[]
     ) => {
       const cancelStartMono = performance.now();
       const gate = gateRef.current;
@@ -406,22 +437,39 @@ export default function App() {
 
       if (reason === 'local_onset') {
         invalidated = gate.localBargeIn().invalidated;
+        // Record the locally-stopped turn as interrupted rather than letting a
+        // later turn_complete label it as a clean completion.
+        let ledgerChanged = false;
+        for (const generationId of invalidated) {
+          if (ledgerRef.current.interrupt(generationId)) ledgerChanged = true;
+        }
+        if (ledgerChanged) setTurns(ledgerRef.current.snapshot());
       } else if (reason === 'server_interrupted') {
-        if (interruptedGenerationId) {
-          invalidated = gate.handleInterruption(interruptedGenerationId, null).invalidated;
+        invalidated =
+          explicitInvalidated ??
+          (interruptedGenerationId
+            ? gate.handleInterruption(interruptedGenerationId, null).invalidated
+            : []);
+        if (interruptedGenerationId && !invalidated.includes(interruptedGenerationId)) {
+          invalidated = [...invalidated, interruptedGenerationId];
         }
       } else {
         invalidated = gate.invalidateAll();
       }
 
-      // Mute + disconnect the dedicated gain node of every generation that can
-      // no longer reach the output.
+      const stopSet = resolvePlaybackStopSet(
+        reason,
+        invalidated,
+        activeSourcesRef.current.map((entry) => entry.generationId)
+      );
+
+      // Mute + detach the gain node of every generation that can no longer
+      // reach the output. Cleanup detaches every node, including generations
+      // whose sources already ended.
       const generationsToMute =
         reason === 'session_cleanup'
           ? [...generationGainsRef.current.keys()]
-          : reason === 'server_interrupted' && interruptedGenerationId
-          ? Array.from(new Set([...invalidated, interruptedGenerationId]))
-          : invalidated;
+          : [...stopSet];
       for (const gen of generationsToMute) {
         const genGain = generationGainsRef.current.get(gen);
         if (genGain) {
@@ -438,22 +486,37 @@ export default function App() {
         }
       }
 
-      // Stop and disconnect every scheduled source. Only one response can be
-      // audible at a time, so this cannot truncate a newer turn.
-      for (const src of activeSourcesRef.current) {
+      const keptSources: typeof activeSourcesRef.current = [];
+      for (const entry of activeSourcesRef.current) {
+        if (reason !== 'session_cleanup' && !stopSet.has(entry.generationId)) {
+          keptSources.push(entry);
+          continue;
+        }
         try {
-          src.stop();
-          src.disconnect();
+          entry.node.stop();
+          entry.node.disconnect();
         } catch {
           /* already stopped */
         }
       }
-      activeSourcesRef.current = [];
+      activeSourcesRef.current = keptSources;
 
       if (outputAudioCtxRef.current) {
-        nextPlayTimeRef.current = outputAudioCtxRef.current.currentTime;
+        // Preserved sources keep their place in the queue. Resetting the cursor
+        // to "now" would make the next chunk overlap audio that was kept.
+        nextPlayTimeRef.current = keptSources.length
+          ? Math.max(...keptSources.map((entry) => entry.endTime))
+          : outputAudioCtxRef.current.currentTime;
       }
       setOutputVolume(0);
+
+      if (reason !== 'session_cleanup') {
+        // The interrupting utterance may still be in progress. Require a pause
+        // before local VAD may cancel again, otherwise the answer to this
+        // barge-in would be killed by the tail of the same utterance.
+        suppressBargeInUntilSilenceRef.current = true;
+        speechOnsetFramesRef.current = 0;
+      }
 
       const cancelDurationMs = Math.round((performance.now() - cancelStartMono) * 100) / 100;
       setActiveSession((prev) =>
@@ -480,6 +543,13 @@ export default function App() {
     cancelAllAssistantAudio('session_cleanup');
     generationGainsRef.current.clear();
     activeSourcesRef.current = [];
+
+    if (pingIntervalRef.current) {
+      clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = null;
+    }
+    suppressBargeInUntilSilenceRef.current = false;
+    speechOnsetFramesRef.current = 0;
 
     if (scriptProcessorRef.current) {
       try {
@@ -720,6 +790,7 @@ export default function App() {
     userSpeechOnsetMonoRef.current = null;
     lastInterruptionMonoRef.current = null;
     localCancellationFiredRef.current = false;
+    suppressBargeInUntilSilenceRef.current = false;
     chunkSequenceRef.current = 0;
     speechOnsetFramesRef.current = 0;
     serverSessionIdRef.current = '';
@@ -850,8 +921,9 @@ export default function App() {
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
-    // Periodic RTT ping/pong (every 5 seconds)
-    let pingInterval: any = setInterval(() => {
+    // Periodic RTT ping/pong (every 5 seconds). The handle is owned by the
+    // component so ending or replacing a session always clears it.
+    pingIntervalRef.current = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'ping', clientMono: performance.now() }));
       }
@@ -995,6 +1067,14 @@ export default function App() {
 
           // Decode and queue 24kHz PCM chunk
           if (outputCtx && outputGainRef.current && msg.data) {
+            // Browsers can suspend the context (tab backgrounding, iOS audio
+            // policy). Scheduling into a suspended context produces silence
+            // until it is resumed, so nudge it on every first chunk.
+            if (outputCtx.state === 'suspended') {
+              void outputCtx.resume().catch(() => {
+                /* resume will be retried with the next chunk */
+              });
+            }
             const float32Samples = base64PCMToFloat32(msg.data);
             const durationSec = float32Samples.length / 24000;
 
@@ -1055,13 +1135,19 @@ export default function App() {
             }
 
             gateRef.current.markPlaybackScheduled(activeGen);
-            source.start(nextPlayTimeRef.current);
-            nextPlayTimeRef.current += audioBuffer.duration;
+            const sourceStartTime = nextPlayTimeRef.current;
+            source.start(sourceStartTime);
+            const sourceEndTime = sourceStartTime + audioBuffer.duration;
+            nextPlayTimeRef.current = sourceEndTime;
 
-            activeSourcesRef.current.push(source);
+            activeSourcesRef.current.push({
+              node: source,
+              generationId: activeGen,
+              endTime: sourceEndTime,
+            });
 
             source.onended = () => {
-              const idx = activeSourcesRef.current.indexOf(source);
+              const idx = activeSourcesRef.current.findIndex((entry) => entry.node === source);
               if (idx !== -1) {
                 activeSourcesRef.current.splice(idx, 1);
               }
@@ -1102,11 +1188,18 @@ export default function App() {
           );
 
           // Stop playback and invalidate exactly the interrupted generation.
+          // The gate advances to the server's next generation exactly once;
+          // the cancellation receives that invalidated set instead of
+          // transitioning the gate a second time.
           const interruptionResult = gateRef.current.handleInterruption(
             msg.interruptedGenerationId,
             msg.nextGenerationId
           );
-          cancelAllAssistantAudio('server_interrupted', msg.interruptedGenerationId);
+          cancelAllAssistantAudio(
+            'server_interrupted',
+            msg.interruptedGenerationId,
+            interruptionResult.invalidated
+          );
           updateAppState('interrupted', 'Model barge-in interruption triggered');
 
           setActiveGenerationId(interruptionResult.nextGenerationId);
@@ -1136,7 +1229,14 @@ export default function App() {
             setTurns(ledgerRef.current.snapshot());
           }
         } else if (msg.type === 'turn_complete') {
-          logEvent('turn_complete', `Turn completed cleanly by Gemini Live API (${msg.completedGenerationId})`);
+          const completedTurn = ledgerRef.current.get(msg.completedGenerationId);
+          const wasInterrupted = completedTurn?.status === 'interrupted';
+          logEvent(
+            'turn_complete',
+            wasInterrupted
+              ? `Turn closed after interruption (${msg.completedGenerationId})`
+              : `Turn completed cleanly by Gemini Live API (${msg.completedGenerationId})`
+          );
           const turnResult = gateRef.current.handleTurnComplete(
             msg.completedGenerationId,
             msg.nextGenerationId
@@ -1145,7 +1245,12 @@ export default function App() {
           localCancellationFiredRef.current = false;
           setActiveGenerationId(turnResult.nextGenerationId);
           setActiveSession((prev) =>
-            prev ? { ...prev, completedTurns: prev.completedTurns + 1 } : null
+            prev
+              ? {
+                  ...prev,
+                  completedTurns: prev.completedTurns + (wasInterrupted ? 0 : 1),
+                }
+              : null
           );
           // Close the turn the event actually refers to, not whichever turn
           // happens to be newest (a late completion can arrive after a new
@@ -1223,7 +1328,10 @@ export default function App() {
 
     ws.onclose = () => {
       if (wsRef.current !== ws || sessionEpochRef.current !== sessionEpoch) return;
-      clearInterval(pingInterval);
+      if (pingIntervalRef.current) {
+        clearInterval(pingIntervalRef.current);
+        pingIntervalRef.current = null;
+      }
       logEvent('info', 'WebSocket connection closed.');
       const state = appStateRef.current;
       if (state !== 'auth_error' && state !== 'quota_exhausted' && state !== 'model_unavailable') {
@@ -1249,33 +1357,41 @@ export default function App() {
 
       // Local speech onset detection & barge-in tracking. Requiring a few
       // consecutive voiced frames (~96ms) prevents speaker echo/noise from
-      // falsely invalidating the current response.
+      // falsely invalidating the current response. After a barge-in, playback
+      // cannot be cancelled again until the user has actually paused, so the
+      // tail of the same utterance cannot kill the model's answer.
       if (isSpeaking) {
         speechOnsetFramesRef.current += 1;
       } else {
         speechOnsetFramesRef.current = 0;
+        suppressBargeInUntilSilenceRef.current = false;
       }
 
-      if (speechOnsetFramesRef.current >= 3) {
-        if (!userSpeechOnsetMonoRef.current) {
-          userSpeechOnsetMonoRef.current = captureMono;
-          setActiveSession((prev) =>
-            prev ? { ...prev, userSpeechOnsetDetections: prev.userSpeechOnsetDetections + 1 } : null
-          );
-        }
+      if (isSpeaking && !userSpeechOnsetMonoRef.current) {
+        userSpeechOnsetMonoRef.current = captureMono;
+        setActiveSession((prev) =>
+          prev ? { ...prev, userSpeechOnsetDetections: prev.userSpeechOnsetDetections + 1 } : null
+        );
+      }
 
-        // If assistant audio is currently playing, the user is barging in.
-        if (gateRef.current.playbackCount() > 0 && !localCancellationFiredRef.current) {
-          localCancellationFiredRef.current = true;
-          setActiveSession((prev) =>
-            prev ? { ...prev, localPlaybackCancellations: prev.localPlaybackCancellations + 1 } : null
-          );
-          // Instant local stop for immediate auditory response. The gate only
-          // invalidates generations that are actually playing / have audio, so
-          // the response to this barge-in is not discarded.
-          updateAppState('interrupted', 'Local voice activity during playback');
-          cancelAllAssistantAudio('local_onset');
-        }
+      if (
+        shouldTriggerLocalBargeIn({
+          isSpeaking,
+          speechFrameCount: speechOnsetFramesRef.current,
+          playbackCount: gateRef.current.playbackCount(),
+          alreadyCancelled: localCancellationFiredRef.current,
+          suppressedUntilSilence: suppressBargeInUntilSilenceRef.current,
+        })
+      ) {
+        localCancellationFiredRef.current = true;
+        setActiveSession((prev) =>
+          prev ? { ...prev, localPlaybackCancellations: prev.localPlaybackCancellations + 1 } : null
+        );
+        // Instant local stop for immediate auditory response. The gate only
+        // invalidates generations that are actually playing / have audio, so
+        // the response to this barge-in is not discarded.
+        updateAppState('interrupted', 'Local voice activity during playback');
+        cancelAllAssistantAudio('local_onset');
       }
 
       // Stage 2: Audio chunk prepared for transmission (resample + 16-bit PCM encode)
@@ -1344,7 +1460,7 @@ export default function App() {
 
   // Copy diagnostics report (Strict credential redaction)
   const copyDiagnostics = () => {
-    const report = {
+    const report = buildDiagnosticsReport({
       modelId,
       sessionDiagnostics: activeSession,
       activeGenerationId,
@@ -1352,9 +1468,8 @@ export default function App() {
       hasConfiguredApiKey: !!apiKey || hasServerKey,
       authSource: apiKey ? 'user_provided_key' : hasServerKey ? 'server_env_key' : 'none',
       microphoneDevice: micDeviceLabel || 'None',
-      quotaStatusNotice: 'Remaining account quota is not exposed by this session API.',
-      recentEvents: events.slice(0, 50),
-    };
+      recentEvents: events,
+    });
     navigator.clipboard.writeText(JSON.stringify(report, null, 2));
     setCopiedLogs(true);
     setTimeout(() => setCopiedLogs(false), 2000);

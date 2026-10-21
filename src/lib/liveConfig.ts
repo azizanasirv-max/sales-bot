@@ -10,6 +10,45 @@ import { composeSystemInstruction, type LanguagePreference } from './conversatio
 
 export const DEFAULT_LIVE_MODEL = 'gemini-3.8-live';
 
+/**
+ * Normalizes the server-side key. AI Studio injects the real secret; a copied
+ * `.env.example` contains the literal placeholder. The placeholder must never
+ * be treated as a usable key (otherwise the UI skips its "key required" flow
+ * and the bridge attempts an authenticated connection with "MY_GEMINI_API_KEY").
+ */
+export function resolveServerApiKey(raw?: string | null): string {
+  const key = (raw || '').trim();
+  if (!key || key === 'MY_GEMINI_API_KEY') return '';
+  return key;
+}
+
+
+/**
+ * Models in this family produce audio natively. Google's Live API documentation
+ * states that "Native audio output models automatically choose the appropriate
+ * language and don't support explicitly setting the language code." Sending
+ * `speechConfig.languageCode` for these models is therefore not a supported
+ * configuration; language locking relies on the system instruction instead.
+ */
+const NATIVE_AUDIO_MODEL_PATTERN =
+  /^(?:gemini-3\.8-live(?:-extended-thinking)?|gemini-3\.1-flash-live(?:-preview)?|.*native-audio.*)$/i;
+
+export function isNativeAudioModel(model: string): boolean {
+  return NATIVE_AUDIO_MODEL_PATTERN.test(model.trim());
+}
+
+/**
+ * Whether `speechConfig.languageCode` is documented as supported for a model.
+ *
+ * Only legacy half-cascade Live models expose this field. Unknown models are
+ * treated as not supporting it, because sending an unsupported setup field is
+ * worse than relying on the (always supported) system instruction.
+ */
+export function supportsSpeechLanguageCode(model: string): boolean {
+  return /^gemini-2\..*-live(?:-|$)/i.test(model.trim()) && !isNativeAudioModel(model);
+}
+
+
 export const DEFAULT_SYSTEM_INSTRUCTION =
   'You are a real-time voice testing assistant. Keep your spoken responses natural, expressive, and concise (1-3 sentences) so the user can easily evaluate speech quality, latency, and barge-in interruption.';
 
@@ -80,21 +119,33 @@ export interface LiveConfigInput {
   language: LanguagePreference;
   baseSystemInstruction?: string;
   resumptionHandle?: string | null;
+  /** Resolved model. Used to decide whether languageCode is supported. */
+  model?: string;
+  /** Explicit override for tests/advanced callers. */
+  supportsLanguageCode?: boolean;
 }
 
 /**
  * Builds the Live API session config.
  *
  * Notes:
- *  - `speechConfig.languageCode` is the strongest application-side lever for
- *    language consistency; it is only sent when the user locked a language.
+ *  - `speechConfig.languageCode` is only sent for models where Google
+ *    documents support for it (legacy half-cascade Live models). Native-audio
+ *    models such as `gemini-3.8-live` choose the language themselves and do not
+ *    support an explicit code; for those the (always supported) system
+ *    instruction is the only language lever.
  *  - `contextWindowCompression.slidingWindow` keeps long sessions (5+ minutes)
  *    from hitting the context limit.
- *  - `sessionResumption` is only added when a handle exists (reconnect), so a
- *    first connection never resumes an unrelated session.
+ *  - `sessionResumption` is only given a handle when reconnecting, so a first
+ *    connection never resumes an unrelated session. An empty object opts the
+ *    session into `sessionResumptionUpdate` frames.
  */
 export function buildLiveConfig(input: LiveConfigInput): LiveConnectConfig {
   const voiceName = (input.voice || '').trim() || 'Puck';
+  const model = input.model || DEFAULT_LIVE_MODEL;
+  const languageCodeSupported =
+    input.supportsLanguageCode ?? supportsSpeechLanguageCode(model);
+
   const config: LiveConnectConfig = {
     responseModalities: [Modality.AUDIO],
     speechConfig: {
@@ -111,7 +162,7 @@ export function buildLiveConfig(input: LiveConfigInput): LiveConnectConfig {
     },
   };
 
-  if (input.language.code) {
+  if (input.language.code && languageCodeSupported) {
     config.speechConfig!.languageCode = input.language.code;
   }
 
@@ -149,4 +200,25 @@ export function classifyLiveError(message: string | null | undefined): LiveError
     return 'MODEL_UNAVAILABLE';
   }
   return 'API_ERROR';
+}
+
+export type TransportCloseDecision = 'fail_initial' | 'resume' | 'close';
+
+/**
+ * Policy applied when the Gemini transport closes.
+ *
+ * - A connection that never became ready is a terminal initialization failure.
+ * - A ready session is resumed only when the API issued a resumption handle
+ *   and attempts remain; otherwise it fails closed rather than silently
+ *   starting a fresh, context-less session.
+ */
+export function decideAfterTransportClose(input: {
+  sawSessionReady: boolean;
+  hasResumeHandle: boolean;
+  reconnectAttempts: number;
+  maxAttempts: number;
+}): TransportCloseDecision {
+  if (!input.sawSessionReady) return 'fail_initial';
+  if (input.hasResumeHandle && input.reconnectAttempts < input.maxAttempts) return 'resume';
+  return 'close';
 }

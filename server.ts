@@ -14,7 +14,9 @@ import {
   DEFAULT_SYSTEM_INSTRUCTION,
   buildLiveConfig,
   classifyLiveError,
+  decideAfterTransportClose,
   resolveLiveModel,
+  resolveServerApiKey,
   validateStartRequest,
 } from './src/lib/liveConfig';
 
@@ -30,8 +32,8 @@ const PORT = Number(process.env.PORT || 3000);
 app.use(express.json());
 
 // Server environment key check. The value is never logged or returned.
-const serverApiKey = (process.env.GEMINI_API_KEY || '').trim();
-const hasServerApiKey = serverApiKey.length > 0 && serverApiKey !== 'MY_GEMINI_API_KEY';
+const serverApiKey = resolveServerApiKey(process.env.GEMINI_API_KEY);
+const hasServerApiKey = serverApiKey.length > 0;
 const TARGET_MODEL = resolveLiveModel(process.env.GEMINI_LIVE_MODEL);
 
 // Reconnection tuning. A resumed Live session preserves the conversation
@@ -78,6 +80,39 @@ app.get('/api/status', (_req, res) => {
 });
 
 /**
+ * WebSocket upgrades are not covered by the browser's same-origin policy, so a
+ * page on any origin could otherwise drive this bridge (and, when configured,
+ * spend the server-side Gemini API key). Allow same-host traffic (the normal
+ * app), the configured APP_URL host (AI Studio), and an explicit allow-list.
+ * Non-browser clients that send no Origin header are allowed.
+ */
+function isAllowedWebSocketOrigin(origin: string | undefined, host: string | undefined): boolean {
+  if (!origin) return true;
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (host && parsed.host === host) return true;
+
+  const appUrl = (process.env.APP_URL || '').trim();
+  if (appUrl && appUrl !== 'MY_APP_URL') {
+    try {
+      if (new URL(appUrl).host === parsed.host) return true;
+    } catch {
+      /* ignore malformed APP_URL */
+    }
+  }
+
+  const allowList = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return allowList.includes(origin);
+}
+
+/**
  * All mutable state for ONE bridge session.
  *
  * Previously these values lived in the `clientWs` connection closure and were
@@ -102,6 +137,13 @@ interface LiveSessionContext {
   language: LanguagePreference;
 
   gemini: Session | null;
+  /**
+   * Increments for every Gemini transport opened for this context. Callbacks
+   * capture the epoch they belong to, so a delayed `onclose`/`onmessage` from a
+   * connection that has already been replaced by a resume cannot tear down the
+   * new connection.
+   */
+  connectionEpoch: number;
   initialized: boolean;
   active: boolean;
   intentionallyClosed: boolean;
@@ -161,6 +203,7 @@ function createSessionContext(
     voice: input.voice,
     language: input.language,
     gemini: null,
+    connectionEpoch: 0,
     initialized: false,
     active: false,
     intentionallyClosed: false,
@@ -202,6 +245,14 @@ function sendToClient(ctx: LiveSessionContext, payload: Record<string, unknown>)
     console.error(`[Live WS] Failed to send frame [${ctx.id}]:`, err?.message || err);
     return false;
   }
+}
+
+/**
+ * A callback is only allowed to mutate state if it belongs to the context that
+ * currently owns the socket *and* to the transport that is currently open.
+ */
+function isCurrentConnection(ctx: LiveSessionContext, epoch: number): boolean {
+  return isCurrent(ctx) && ctx.connectionEpoch === epoch;
 }
 
 function nextGeneration(ctx: LiveSessionContext): string {
@@ -278,8 +329,12 @@ function closeSession(ctx: LiveSessionContext, reason: string): void {
  * so those parts are tagged with the new generation instead of the obsolete one
  * (which the client would immediately drop).
  */
-function handleServerMessage(ctx: LiveSessionContext, message: LiveServerMessage): void {
-  if (!isCurrent(ctx)) return;
+function handleServerMessage(
+  ctx: LiveSessionContext,
+  message: LiveServerMessage,
+  epoch: number
+): void {
+  if (!isCurrentConnection(ctx, epoch)) return;
   const recvMono = performance.now();
   const recvUtc = new Date().toISOString();
   const serverContent = message.serverContent;
@@ -525,8 +580,12 @@ async function attemptResume(ctx: LiveSessionContext): Promise<void> {
  * become ready is resumed, and only with a server-issued resumption handle -
  * this avoids silently creating a fresh (context-less) session.
  */
-function handleLiveClose(ctx: LiveSessionContext, e: { code?: number; reason?: string }): void {
-  if (!isCurrent(ctx)) return;
+function handleLiveClose(
+  ctx: LiveSessionContext,
+  e: { code?: number; reason?: string },
+  epoch: number
+): void {
+  if (!isCurrentConnection(ctx, epoch)) return;
   ctx.active = false;
   ctx.initialized = false;
   ctx.gemini = null;
@@ -537,7 +596,14 @@ function handleLiveClose(ctx: LiveSessionContext, e: { code?: number; reason?: s
   if (reason) ctx.lastError = reason;
   console.log(`[Live WS] Gemini Live socket closed [${ctx.id}] code=${code} reason="${reason}"`);
 
-  if (!ctx.sawSessionReady) {
+  const decision = decideAfterTransportClose({
+    sawSessionReady: ctx.sawSessionReady,
+    hasResumeHandle: Boolean(ctx.resumeHandle),
+    reconnectAttempts: ctx.reconnectAttempts,
+    maxAttempts: MAX_RESUME_ATTEMPTS,
+  });
+
+  if (decision === 'fail_initial') {
     const errorCode = classifyLiveError(reason);
     reportSessionFailure(
       ctx,
@@ -549,7 +615,7 @@ function handleLiveClose(ctx: LiveSessionContext, e: { code?: number; reason?: s
     return;
   }
 
-  if (ctx.resumeHandle && ctx.reconnectAttempts < MAX_RESUME_ATTEMPTS) {
+  if (decision === 'resume') {
     scheduleResume(ctx);
     return;
   }
@@ -599,12 +665,15 @@ async function openLive(
   ctx.pendingResume = isResume;
   ctx.connecting = true;
   ctx.reconnecting = isResume;
+  ctx.connectionEpoch += 1;
+  const epoch = ctx.connectionEpoch;
 
   const config = buildLiveConfig({
     voice: ctx.voice,
     language: ctx.language,
     baseSystemInstruction: ctx.baseInstruction,
     resumptionHandle: resumptionHandle || null,
+    model: ctx.model,
   });
 
   console.log(
@@ -629,7 +698,7 @@ async function openLive(
         config,
         callbacks: {
         onopen: () => {
-          if (!isCurrent(ctx)) return;
+          if (!isCurrentConnection(ctx, epoch)) return;
           console.log(`[Live WS] Transport open to Gemini Live API [${ctx.id}]`);
           if (!isResume) {
             sendToClient(ctx, {
@@ -643,12 +712,13 @@ async function openLive(
         },
         onmessage: (message: LiveServerMessage) => {
           try {
-            handleServerMessage(ctx, message);
+            handleServerMessage(ctx, message, epoch);
           } catch (err: any) {
             console.error(`[Live WS] Gemini message handling error [${ctx.id}]:`, err?.message || err);
           }
         },
         onerror: (err: any) => {
+          if (!isCurrentConnection(ctx, epoch)) return;
           ctx.lastError = err?.message || 'Gemini Live session error occurred.';
           console.error(`[Live WS] Gemini Live session error [${ctx.id}]:`, ctx.lastError);
           // Do not report here: `onclose` is the single authority for terminal
@@ -656,7 +726,7 @@ async function openLive(
           // sockets that close before `setupComplete`.
         },
         onclose: (e: any) => {
-          handleLiveClose(ctx, { code: e?.code, reason: e?.reason });
+          handleLiveClose(ctx, { code: e?.code, reason: e?.reason }, epoch);
         },
       },
       }),
@@ -664,7 +734,7 @@ async function openLive(
       'Timed out while opening the Gemini Live session.'
     );
 
-    if (!isCurrent(ctx)) {
+    if (!isCurrentConnection(ctx, epoch)) {
       try {
         session.close();
       } catch {
@@ -809,8 +879,37 @@ function handleAudioFrame(ctx: LiveSessionContext, data: any): void {
 // WebSocket Server for Gemini Live API bidirectional bridge
 const wss = new WebSocketServer({ noServer: true });
 
+/**
+ * Application-level liveness. The client pings every 5 s, but a half-open TCP
+ * connection can otherwise hold a Gemini session (and its quota) for minutes
+ * after the browser disappears. Terminating silent peers also guarantees their
+ * per-socket context is closed.
+ */
+const WS_HEARTBEAT_MS = 30000;
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients as Set<WebSocket & { isAlive?: boolean }>) {
+    if (ws.isAlive === false) {
+      console.warn('[Live WS] Terminating unresponsive client socket');
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    try {
+      ws.ping();
+    } catch {
+      /* close handler will clean up */
+    }
+  }
+}, WS_HEARTBEAT_MS);
+heartbeat.unref?.();
+
 wss.on('connection', (clientWs: WebSocket) => {
   console.log('[Live WS] Client connected to live session bridge');
+  const tracked = clientWs as WebSocket & { isAlive?: boolean };
+  tracked.isAlive = true;
+  tracked.on('pong', () => {
+    tracked.isAlive = true;
+  });
 
   clientWs.on('message', async (raw) => {
     let data: any;
@@ -913,10 +1012,26 @@ server.on('upgrade', (request, socket, head) => {
   try {
     const { pathname } = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
     if (pathname === '/api/live-ws') {
+      // Behind Cloud Run/proxies the public host may only be present in
+      // X-Forwarded-Host.
+      const forwardedHost = request.headers['x-forwarded-host'];
+      const publicHost = Array.isArray(forwardedHost)
+        ? forwardedHost[0]
+        : forwardedHost || request.headers.host;
+      if (!isAllowedWebSocketOrigin(request.headers.origin, publicHost)) {
+        console.warn(`[Server Upgrade] Rejected WebSocket origin: ${request.headers.origin}`);
+        socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
       wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit('connection', ws, request);
       });
+      return;
     }
+    // Unknown upgrade paths must not be left dangling.
+    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+    socket.destroy();
   } catch (err) {
     console.error('[Server Upgrade] Error parsing URL:', err);
     socket.destroy();

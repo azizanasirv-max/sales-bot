@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 const MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.8-live';
 import { ConversationGate } from '../src/lib/conversation';
+import { buildDiagnosticsReport } from '../src/lib/diagnostics';
 
 interface TestResult {
   name: string;
@@ -303,14 +304,22 @@ async function runSuite() {
   try {
     const t0 = performance.now();
     const rawApiKey = 'AIzaSyFakeKeyForTest1234567890';
-    // Verify client diagnostics export format
-    const sampleExport = {
-      modelId: MODEL,
-      hasConfiguredApiKey: true,
-      authSource: 'user_provided_key',
-      recentEvents: [{ type: 'info', message: 'User configured Gemini API key in session storage.' }],
-    };
-    const jsonStr = JSON.stringify(sampleExport);
+    // Exercise the real export builder with a key present in the surrounding
+    // state; it must only emit whitelisted fields.
+    const jsonStr = JSON.stringify(
+      buildDiagnosticsReport({
+        modelId: MODEL,
+        sessionDiagnostics: { sessionId: 'sess_test' },
+        activeGenerationId: 'gen_0',
+        language: 'Auto',
+        hasConfiguredApiKey: true,
+        authSource: 'user_provided_key',
+        microphoneDevice: 'Test Mic',
+        recentEvents: [{ type: 'info', message: 'User configured Gemini API key in session storage.' }],
+        // @ts-expect-error verifying that extra fields are dropped
+        apiKey: rawApiKey,
+      })
+    );
     assert(!jsonStr.includes(rawApiKey), 'Raw API key must never appear in export');
     assert(jsonStr.includes('user_provided_key'), 'Auth source status must be visible');
 

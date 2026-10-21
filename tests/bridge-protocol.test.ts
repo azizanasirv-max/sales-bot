@@ -36,9 +36,9 @@ async function waitForServer(timeoutMs = 20000): Promise<void> {
   throw new Error('Bridge server did not start in time');
 }
 
-function openSocket(): Promise<WebSocket> {
+function openSocket(origin?: string): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(WS_URL);
+    const ws = new WebSocket(WS_URL, origin ? { origin } : undefined);
     sockets.push(ws);
     const timer = setTimeout(() => reject(new Error('WebSocket open timeout')), 5000);
     ws.on('open', () => {
@@ -46,6 +46,28 @@ function openSocket(): Promise<WebSocket> {
       resolve(ws);
     });
     ws.on('error', reject);
+  });
+}
+
+function expectUpgradeRejected(origin: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(WS_URL, { origin });
+    const timer = setTimeout(() => reject(new Error('Expected the upgrade to be rejected')), 5000);
+    ws.on('unexpected-response', (_req, res) => {
+      clearTimeout(timer);
+      const status = res.statusCode ?? 0;
+      res.resume();
+      ws.terminate();
+      resolve(status);
+    });
+    ws.on('open', () => {
+      clearTimeout(timer);
+      ws.close();
+      reject(new Error('Cross-origin upgrade was accepted'));
+    });
+    ws.on('error', () => {
+      /* an error may follow unexpected-response; the status is authoritative */
+    });
   });
 }
 
@@ -201,5 +223,18 @@ test('end without a live session is harmless and the socket stays usable', async
   ws.send(JSON.stringify({ type: 'ping', clientMono: 99 }));
   const pong = await nextMessage(ws, (m) => m.type === 'pong');
   assert.equal(pong.clientMono, 99);
+});
+
+test('WebSocket upgrades are same-origin (and explicit allow-list) only', async () => {
+  // The regular test client sends no Origin header, which is allowed for
+  // non-browser clients. A browser on the same host is also allowed.
+  const sameOrigin = await openSocket(HTTP_BASE);
+  sameOrigin.send(JSON.stringify({ type: 'ping', clientMono: 7 }));
+  const pong = await nextMessage(sameOrigin, (m) => m.type === 'pong');
+  assert.equal(pong.clientMono, 7);
+
+  // A page on another origin must not be able to spend the server-side key.
+  const status = await expectUpgradeRejected('https://evil.example');
+  assert.equal(status, 403);
 });
 
