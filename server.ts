@@ -96,6 +96,18 @@ function isAllowedWebSocketOrigin(origin: string | undefined, host: string | und
   }
   if (host && parsed.host === host) return true;
 
+  const hostname = parsed.hostname;
+  if (
+    hostname.endsWith('.run.app') ||
+    hostname.endsWith('.google.com') ||
+    hostname.endsWith('.googleusercontent.com') ||
+    hostname === 'localhost' ||
+    hostname === '127.0.0.1' ||
+    hostname.includes('aistudio')
+  ) {
+    return true;
+  }
+
   const appUrl = (process.env.APP_URL || '').trim();
   if (appUrl && appUrl !== 'MY_APP_URL') {
     try {
@@ -1029,9 +1041,8 @@ server.on('upgrade', (request, socket, head) => {
       });
       return;
     }
-    // Unknown upgrade paths must not be left dangling.
-    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
-    socket.destroy();
+    // For non /api/live-ws upgrade requests (such as Vite HMR), do not handle or destroy;
+    // let Vite middleware handle them or ignore.
   } catch (err) {
     console.error('[Server Upgrade] Error parsing URL:', err);
     socket.destroy();
