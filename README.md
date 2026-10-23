@@ -33,6 +33,7 @@ Key files:
 | `tests/bridge-protocol.test.ts` | Spawns the real server without a key and verifies the transport contract |
 | `tests/interruption-suite.ts` | Live-API interruption suite (requires `GEMINI_API_KEY` + running server) |
 | `tests/live-controlled-trials.ts` | Live-API controlled barge-in trials using WAV fixtures |
+| `docs/interruption-root-cause.md` | Interruption audit, root causes, verification and live-test plan |
 
 ## Conversation flow
 
@@ -47,12 +48,16 @@ Key files:
    chunks while no Live context is active (connecting/reconnecting).
 5. Model audio is tagged with a **generation ID**. The client's
    `ConversationGate` decides whether each chunk may be decoded and scheduled.
-6. `turn_complete` advances the server generation and closes exactly the turn it
-   names in the client `TurnLedger`.
+6. `turn_complete` closes exactly the turn it names in the client `TurnLedger`
+   and advances the server generation once per completed turn. The API follows
+   an interruption with `turn_complete` for the *interrupted* turn; that closing
+   event names the interrupted generation and does not consume an extra ID.
 7. Barge-in: local VAD stops playback immediately and invalidates only the
    generations that are playing or still streaming. The server's `interrupted`
-   event invalidates the reported generation and advances to the next one, whose
-   audio is accepted normally.
+   event invalidates the generation that produced the audio being played (never
+   an empty slot reserved by `turn_complete`) plus any older generation still
+   queued, and reserves exactly one generation for the answer whose audio is
+   accepted normally. Duplicate interruption frames are ignored.
 8. On transport loss after a ready session the bridge resumes the Live session
    with its resumption handle (max 2 attempts). The client keeps its audio graph,
    history and language; if resumption is impossible the session fails closed
@@ -110,9 +115,13 @@ GEMINI_API_KEY=... npm run test:live  # live interruption suite (server must be 
 
 The UI exposes latency stages (capture → send → bridge → first audio → audible),
 generation IDs, interruption counts, playback cancellation counts, turn records
-and a redacted JSON export. The bridge logs session creation/termination,
-generations, interruptions, expiry and resume attempts without audio payloads or
-credentials.
+and a redacted JSON export. Interruption timing distinguishes **onset → silence**
+(local VAD or server frame → gain mute) from **interruption → next response
+audible**, and counts stale chunks dropped after cancellation, duplicate
+interruption frames and bridge → browser delivery delay. The bridge logs session
+creation/termination, generations, interruptions, expiry and resume attempts
+without audio payloads or credentials, including whether microphone chunks were
+still reaching Gemini when an interruption was detected.
 
 ## Known limitations
 

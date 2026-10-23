@@ -187,6 +187,8 @@ interface LiveSessionContext {
   interruptedGenerationId: string | null;
   /** Audio/text parts dropped because they arrived with an interruption flag. */
   modelPartsDroppedAfterInterrupt: number;
+  /** Session total of audio/text parts dropped with an interruption flag. */
+  modelPartsDroppedTotal: number;
   lastMicForwardedMono: number | null;
 
   micChunksReceived: number;
@@ -250,6 +252,7 @@ function createSessionContext(
     lastContentGenerationId: null,
     interruptedGenerationId: null,
     modelPartsDroppedAfterInterrupt: 0,
+    modelPartsDroppedTotal: 0,
     lastMicForwardedMono: null,
     micChunksReceived: 0,
     micChunksForwarded: 0,
@@ -347,7 +350,7 @@ function closeSession(ctx: LiveSessionContext, reason: string): void {
     `[Live WS] Session closed [${ctx.id}] reason="${reason}" ` +
       `mic=${ctx.micChunksForwarded}/${ctx.micChunksReceived} ` +
       `modelChunks=${ctx.modelChunksDelivered} interruptions=${ctx.serverInterruptionEventsCount} ` +
-      `turns=${ctx.completedTurnsCount} droppedAfterInterrupt=${ctx.modelPartsDroppedAfterInterrupt}`
+      `turns=${ctx.completedTurnsCount} droppedAfterInterrupt=${ctx.modelPartsDroppedTotal}`
   );
   if (sessionBySocket.get(ctx.clientWs) === ctx) sessionBySocket.delete(ctx.clientWs);
 }
@@ -440,6 +443,9 @@ function handleServerMessage(
       ctx.interruptedGenerations.add(interruptedGen);
       ctx.serverInterruptionEventsCount += 1;
       ctx.interruptedGenerationId = interruptedGen;
+      // Count content dropped for *this* interruption, separately from the
+      // session total used in the close log.
+      ctx.modelPartsDroppedAfterInterrupt = 0;
     }
     // Reserve the next slot once per interrupted turn. A duplicate event must
     // not consume another generation ID.
@@ -484,6 +490,7 @@ function handleServerMessage(
       // freshly reserved generation ID would schedule stale audio for the new
       // turn.
       ctx.modelPartsDroppedAfterInterrupt += modelTurn.parts.length;
+      ctx.modelPartsDroppedTotal += modelTurn.parts.length;
       ctx.modelChunksReceived += modelTurn.parts.filter((part) => part.inlineData?.data).length;
       console.log(
         `[Live WS] Dropped ${modelTurn.parts.length} content part(s) received with interruption [${ctx.id}]`
@@ -554,7 +561,9 @@ function handleServerMessage(
       completedTurnsCount: ctx.completedTurnsCount,
       closesInterruptedTurn: completion.closesInterruptedTurn,
       micChunksForwarded: ctx.micChunksForwarded,
-      modelPartsDroppedAfterInterrupt: ctx.modelPartsDroppedAfterInterrupt,
+      modelPartsDroppedAfterInterrupt: completion.closesInterruptedTurn
+        ? ctx.modelPartsDroppedAfterInterrupt
+        : 0,
       serverMono: recvMono,
       serverUtc: recvUtc,
     });
