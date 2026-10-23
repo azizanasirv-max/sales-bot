@@ -7,7 +7,9 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, type LiveServerMessage, type Session } from '@google/genai';
 import {
   INITIAL_GENERATION_ID,
+  resolveInterruptionAttribution,
   resolveLanguagePreference,
+  resolveTurnCompletion,
   type LanguagePreference,
 } from './src/lib/conversation';
 import {
@@ -173,6 +175,19 @@ interface LiveSessionContext {
   currentGenerationId: string;
   chunkSeqInGeneration: number;
   interruptedGenerations: Set<string>;
+  /**
+   * Generation that last delivered audio or text. The Live API's
+   * `interrupted` flag refers to the model generation that was being produced,
+   * which is not always `currentGenerationId`: after `turn_complete` the
+   * bridge has already reserved the next slot while the client may still be
+   * playing the previous response.
+   */
+  lastContentGenerationId: string | null;
+  /** Interrupted generation whose trailing `turn_complete` is still expected. */
+  interruptedGenerationId: string | null;
+  /** Audio/text parts dropped because they arrived with an interruption flag. */
+  modelPartsDroppedAfterInterrupt: number;
+  lastMicForwardedMono: number | null;
 
   micChunksReceived: number;
   micChunksForwarded: number;
@@ -232,6 +247,10 @@ function createSessionContext(
     currentGenerationId: INITIAL_GENERATION_ID,
     chunkSeqInGeneration: 0,
     interruptedGenerations: new Set<string>(),
+    lastContentGenerationId: null,
+    interruptedGenerationId: null,
+    modelPartsDroppedAfterInterrupt: 0,
+    lastMicForwardedMono: null,
     micChunksReceived: 0,
     micChunksForwarded: 0,
     micChunksDropped: 0,
@@ -328,7 +347,7 @@ function closeSession(ctx: LiveSessionContext, reason: string): void {
     `[Live WS] Session closed [${ctx.id}] reason="${reason}" ` +
       `mic=${ctx.micChunksForwarded}/${ctx.micChunksReceived} ` +
       `modelChunks=${ctx.modelChunksDelivered} interruptions=${ctx.serverInterruptionEventsCount} ` +
-      `turns=${ctx.completedTurnsCount}`
+      `turns=${ctx.completedTurnsCount} droppedAfterInterrupt=${ctx.modelPartsDroppedAfterInterrupt}`
   );
   if (sessionBySocket.get(ctx.clientWs) === ctx) sessionBySocket.delete(ctx.clientWs);
 }
@@ -400,83 +419,142 @@ function handleServerMessage(
     }
   }
 
-  // Stage C: interruption must be handled before any content in this frame.
-  if (serverContent?.interrupted) {
-    const interruptedGen = ctx.currentGenerationId;
-    const firstObservation = !ctx.interruptedGenerations.has(interruptedGen);
-    if (firstObservation) {
+  // Stage C: interruption attribution.
+  //
+  // The API sends `interrupted` (and then `turnComplete`) for the generation
+  // it was producing. `ctx.currentGenerationId` may already be a reserved,
+  // content-less slot because `turnComplete` moved it while the browser was
+  // still playing the previous response. Attributing the interruption to that
+  // empty slot would leave the audible tail playing, so attribute it to the
+  // last generation that actually delivered content.
+  const interruptedInFrame = Boolean(serverContent?.interrupted);
+  if (interruptedInFrame) {
+    const attribution = resolveInterruptionAttribution({
+      currentGenerationId: ctx.currentGenerationId,
+      lastContentGenerationId: ctx.lastContentGenerationId,
+      alreadyInterrupted: [...ctx.interruptedGenerations],
+    });
+    const interruptedGen = attribution.interruptedGenerationId;
+
+    if (!attribution.duplicate) {
       ctx.interruptedGenerations.add(interruptedGen);
       ctx.serverInterruptionEventsCount += 1;
+      ctx.interruptedGenerationId = interruptedGen;
     }
-    nextGeneration(ctx);
+    // Reserve the next slot once per interrupted turn. A duplicate event must
+    // not consume another generation ID.
+    if (attribution.advanceGeneration) nextGeneration(ctx);
+
     console.log(
       `[Live WS] Interruption [${ctx.id}] ${interruptedGen} -> ${ctx.currentGenerationId}` +
-        `${firstObservation ? '' : ' (duplicate event)'}`
+        `${attribution.duplicate ? ' (duplicate event)' : ''}` +
+        ` micForwarded=${ctx.micChunksForwarded}`
     );
     sendToClient(ctx, {
       type: 'interrupted',
       sessionId: ctx.id,
       interruptedGenerationId: interruptedGen,
       nextGenerationId: ctx.currentGenerationId,
+      duplicate: attribution.duplicate,
       serverInterruptionCount: ctx.serverInterruptionEventsCount,
+      // Diagnostic evidence: the microphone transport was still live at the
+      // moment the server reported the interruption.
+      micChunksReceived: ctx.micChunksReceived,
+      micChunksForwarded: ctx.micChunksForwarded,
+      micChunksDropped: ctx.micChunksDropped,
+      msSinceLastMicForward:
+        ctx.lastMicForwardedMono === null
+          ? null
+          : Math.round((recvMono - ctx.lastMicForwardedMono) * 10) / 10,
       bridgeInterruptedRecvMono: recvMono,
       bridgeInterruptedRecvUtc: recvUtc,
       bridgeInterruptedSentMono: performance.now(),
+      bridgeInterruptedSentUtc: new Date().toISOString(),
     });
   }
 
   // Stage B: model turn content (24kHz PCM chunks & text transcript)
   const modelTurn = serverContent?.modelTurn;
   if (modelTurn?.parts?.length) {
-    if (ctx.currentGenerationId === INITIAL_GENERATION_ID) {
-      nextGeneration(ctx);
-    }
-    for (const part of modelTurn.parts) {
-      if (part.inlineData?.data) {
-        ctx.modelChunksReceived += 1;
-        ctx.modelChunksDelivered += 1;
-        ctx.chunkSeqInGeneration += 1;
-        sendToClient(ctx, {
-          type: 'audio',
-          sessionId: ctx.id,
-          generationId: ctx.currentGenerationId,
-          chunkSeq: ctx.chunkSeqInGeneration,
-          data: part.inlineData.data,
-          mimeType: part.inlineData.mimeType || 'audio/pcm;rate=24000',
-          bridgeRecvMono: recvMono,
-          bridgeSentMono: performance.now(),
-          serverUtc: recvUtc,
-        });
+    if (interruptedInFrame) {
+      // Content that arrives in the same server message as the interruption
+      // belongs to the generation that was just interrupted: the answer to the
+      // interrupting utterance cannot exist yet (the API sends `interrupted >
+      // turnComplete` before producing the next turn). Forwarding it under the
+      // freshly reserved generation ID would schedule stale audio for the new
+      // turn.
+      ctx.modelPartsDroppedAfterInterrupt += modelTurn.parts.length;
+      ctx.modelChunksReceived += modelTurn.parts.filter((part) => part.inlineData?.data).length;
+      console.log(
+        `[Live WS] Dropped ${modelTurn.parts.length} content part(s) received with interruption [${ctx.id}]`
+      );
+    } else {
+      if (ctx.currentGenerationId === INITIAL_GENERATION_ID) {
+        nextGeneration(ctx);
       }
-      if (part.text) {
-        sendToClient(ctx, {
-          type: 'text',
-          sessionId: ctx.id,
-          generationId: ctx.currentGenerationId,
-          text: part.text,
-          serverMono: recvMono,
-          serverUtc: recvUtc,
-        });
+      for (const part of modelTurn.parts) {
+        if (part.inlineData?.data) {
+          ctx.modelChunksReceived += 1;
+          ctx.modelChunksDelivered += 1;
+          ctx.chunkSeqInGeneration += 1;
+          ctx.lastContentGenerationId = ctx.currentGenerationId;
+          sendToClient(ctx, {
+            type: 'audio',
+            sessionId: ctx.id,
+            generationId: ctx.currentGenerationId,
+            chunkSeq: ctx.chunkSeqInGeneration,
+            data: part.inlineData.data,
+            mimeType: part.inlineData.mimeType || 'audio/pcm;rate=24000',
+            bridgeRecvMono: recvMono,
+            bridgeSentMono: performance.now(),
+            serverUtc: recvUtc,
+          });
+        }
+        if (part.text) {
+          ctx.lastContentGenerationId = ctx.currentGenerationId;
+          sendToClient(ctx, {
+            type: 'text',
+            sessionId: ctx.id,
+            generationId: ctx.currentGenerationId,
+            text: part.text,
+            serverMono: recvMono,
+            serverUtc: recvUtc,
+          });
+        }
       }
     }
   }
 
-  // Stage D: turn complete. The generation counter always advances so a new
-  // response can never reuse the ID of a turn the client already closed.
+  // Stage D: turn complete.
+  //
+  // After an interruption the API closes the interrupted turn with
+  // `turnComplete`. The bridge has already reserved the next slot, so that
+  // completion must name the interrupted generation and must not advance the
+  // counter a second time for the same turn.
   if (serverContent?.turnComplete) {
-    const completedGen = ctx.currentGenerationId;
-    ctx.completedTurnsCount += 1;
-    nextGeneration(ctx);
+    const completion = resolveTurnCompletion({
+      currentGenerationId: ctx.currentGenerationId,
+      currentHasContent: ctx.lastContentGenerationId === ctx.currentGenerationId,
+      interruptedGenerationId: ctx.interruptedGenerationId,
+    });
+    if (completion.advanceGeneration) nextGeneration(ctx);
+    if (!completion.closesInterruptedTurn) ctx.completedTurnsCount += 1;
+    ctx.interruptedGenerationId = null;
+
     console.log(
-      `[Live WS] Turn complete [${ctx.id}] ${completedGen} -> ${ctx.currentGenerationId} ` +
-        `(turns=${ctx.completedTurnsCount})`
+      `[Live WS] Turn complete [${ctx.id}] ${completion.completedGenerationId} -> ` +
+        `${ctx.currentGenerationId} (turns=${ctx.completedTurnsCount}` +
+        `${completion.closesInterruptedTurn ? ', closed interrupted turn' : ''})`
     );
     sendToClient(ctx, {
       type: 'turn_complete',
       sessionId: ctx.id,
-      completedGenerationId: completedGen,
+      completedGenerationId: completion.completedGenerationId,
       nextGenerationId: ctx.currentGenerationId,
       completedTurnsCount: ctx.completedTurnsCount,
+      closesInterruptedTurn: completion.closesInterruptedTurn,
+      micChunksForwarded: ctx.micChunksForwarded,
+      modelPartsDroppedAfterInterrupt: ctx.modelPartsDroppedAfterInterrupt,
       serverMono: recvMono,
       serverUtc: recvUtc,
     });
@@ -870,6 +948,7 @@ function handleAudioFrame(ctx: LiveSessionContext, data: any): void {
     });
     ctx.micChunksForwarded += 1;
     const bridgeFwdMono = performance.now();
+    ctx.lastMicForwardedMono = bridgeFwdMono;
 
     if (data.seq && data.seq % 50 === 0) {
       sendToClient(ctx, {

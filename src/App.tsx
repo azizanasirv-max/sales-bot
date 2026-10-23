@@ -109,6 +109,16 @@ export interface SessionDiagnostics {
   bridgeForwardDurationMs: number | null;
   interruptionToStopDurationMs: number | null;
   interruptionToNextResponseAudibleMs: number | null;
+  /**
+   * First local VAD onset → assistant audio actually muted. Includes the
+   * onset debounce (~96 ms at 32 ms frames) and is measured separately from
+   * interruption → next response audio.
+   */
+  localOnsetToPlaybackSilenceMs: number | null;
+  /** Server interruption frame received → assistant audio actually muted. */
+  serverInterruptionToPlaybackSilenceMs: number | null;
+  /** Approximate bridge → browser delivery delay (wall clocks, may skew). */
+  bridgeToBrowserInterruptionDelayMs: number | null;
   firstAudioLatencyMs: number | null;
 
   // Packet counters (Strictly isolated per session)
@@ -125,7 +135,9 @@ export interface SessionDiagnostics {
   userSpeechOnsetDetections: number;
   localPlaybackCancellations: number;
   geminiInterruptionEventsReceived: number;
+  duplicateInterruptionEvents: number;
   uniqueGenerationsInterrupted: number;
+  staleAudioChunksDropped: number;
   completedTurns: number;
   interruptionTimingOutcome: 'none' | 'stopped_locally_before_server' | 'stopped_on_server_event';
 
@@ -236,6 +248,9 @@ export default function App() {
   // Timestamps for pipeline measurement
   const sessionStartMonoRef = useRef<number>(0);
   const userSpeechOnsetMonoRef = useRef<number | null>(null);
+  /** Monotonic start of the current local VAD utterance (for onset→silence). */
+  const utteranceOnsetMonoRef = useRef<number | null>(null);
+  const speechActiveRef = useRef<boolean>(false);
   const lastInterruptionMonoRef = useRef<number | null>(null);
   const localCancellationFiredRef = useRef<boolean>(false);
   const suppressBargeInUntilSilenceRef = useRef<boolean>(false);
@@ -519,20 +534,44 @@ export default function App() {
       }
 
       const cancelDurationMs = Math.round((performance.now() - cancelStartMono) * 100) / 100;
+
+      // "Playback is silent" is observed after every affected source has been
+      // stopped and its gain muted. Keep it separate from the cancellation
+      // work duration: onset→silence includes the local VAD debounce.
+      const silenceMono = performance.now();
+      const onsetMono = utteranceOnsetMonoRef.current;
+      const localOnsetToSilenceMs =
+        reason === 'local_onset' && onsetMono !== null
+          ? Math.round((silenceMono - onsetMono) * 10) / 10
+          : null;
+      const serverInterruptionMono = lastInterruptionMonoRef.current;
+      const serverToSilenceMs =
+        reason === 'server_interrupted' && serverInterruptionMono !== null
+          ? Math.round((silenceMono - serverInterruptionMono) * 10) / 10
+          : null;
+
       setActiveSession((prev) =>
         prev
           ? {
               ...prev,
               interruptionToStopDurationMs: cancelDurationMs,
+              ...(localOnsetToSilenceMs !== null
+                ? { localOnsetToPlaybackSilenceMs: localOnsetToSilenceMs }
+                : {}),
+              ...(serverToSilenceMs !== null
+                ? { serverInterruptionToPlaybackSilenceMs: serverToSilenceMs }
+                : {}),
             }
           : null
       );
 
       logEvent(
         'pipeline',
-        `Playback cancelled [Reason: ${reason}, Gens: ${
+        `Playback silent [Reason: ${reason}, Gens: ${
           invalidated.length ? invalidated.join(', ') : 'none'
-        }] in ${cancelDurationMs}ms (Stage 9 & 10)`
+        }] cancel-work=${cancelDurationMs}ms` +
+          `${localOnsetToSilenceMs !== null ? `, onset→silence=${localOnsetToSilenceMs}ms` : ''}` +
+          `${serverToSilenceMs !== null ? `, server-recv→silence=${serverToSilenceMs}ms` : ''}`
       );
     },
     [logEvent]
@@ -550,6 +589,8 @@ export default function App() {
     }
     suppressBargeInUntilSilenceRef.current = false;
     speechOnsetFramesRef.current = 0;
+    speechActiveRef.current = false;
+    utteranceOnsetMonoRef.current = null;
 
     if (scriptProcessorRef.current) {
       try {
@@ -788,6 +829,8 @@ export default function App() {
     const startUtc = new Date().toISOString();
     sessionStartMonoRef.current = startMono;
     userSpeechOnsetMonoRef.current = null;
+    utteranceOnsetMonoRef.current = null;
+    speechActiveRef.current = false;
     lastInterruptionMonoRef.current = null;
     localCancellationFiredRef.current = false;
     suppressBargeInUntilSilenceRef.current = false;
@@ -819,6 +862,9 @@ export default function App() {
       bridgeForwardDurationMs: null,
       interruptionToStopDurationMs: null,
       interruptionToNextResponseAudibleMs: null,
+      localOnsetToPlaybackSilenceMs: null,
+      serverInterruptionToPlaybackSilenceMs: null,
+      bridgeToBrowserInterruptionDelayMs: null,
       firstAudioLatencyMs: null,
       micChunksCaptured: 0,
       micChunksSent: 0,
@@ -831,7 +877,9 @@ export default function App() {
       userSpeechOnsetDetections: 0,
       localPlaybackCancellations: 0,
       geminiInterruptionEventsReceived: 0,
+      duplicateInterruptionEvents: 0,
       uniqueGenerationsInterrupted: 0,
+      staleAudioChunksDropped: 0,
       completedTurns: 0,
       interruptionTimingOutcome: 'none',
       usageMetadata: null,
@@ -1034,6 +1082,9 @@ export default function App() {
           // ever dropping the pending generation that answers a barge-in.
           const acceptance = gateRef.current.acceptAudio(msg.generationId);
           if (!acceptance.accepted) {
+            setActiveSession((prev) =>
+              prev ? { ...prev, staleAudioChunksDropped: prev.staleAudioChunksDropped + 1 } : null
+            );
             const key = `${msg.generationId}:${acceptance.reason}`;
             if (!rejectedGenerationLoggedRef.current.has(key)) {
               rejectedGenerationLoggedRef.current.add(key);
@@ -1182,19 +1233,58 @@ export default function App() {
           // Stage 6, 7 & 8: Interruption event delivered to browser
           const interruptedGen =
             msg.interruptedGenerationId || gateRef.current.getActiveGenerationId();
+          const isDuplicate = msg.duplicate === true;
+          // Server-side evidence: was the microphone still reaching Gemini when
+          // the interruption was detected, and how long did the frame take to
+          // reach this browser? (Wall clocks can skew; flagged as approximate.)
+          const bridgeToBrowserMs =
+            typeof msg.bridgeInterruptedSentUtc === 'string'
+              ? Date.parse(msg.bridgeInterruptedSentUtc)
+              : NaN;
+          const bridgeToBrowserDelayMs = Number.isFinite(bridgeToBrowserMs)
+            ? Math.round((Date.now() - bridgeToBrowserMs) * 10) / 10
+            : null;
+
           logEvent(
             'interrupted',
-            `⚡ Gemini Live server reported interruption of ${interruptedGen} (Stage 6–8)`
+            `${isDuplicate ? 'Duplicate interruption event (ignored)' : '⚡ Gemini Live server reported interruption'} ` +
+              `of ${interruptedGen} (Stage 6–8)` +
+              `${typeof msg.micChunksForwarded === 'number' ? `; mic forwarded=${msg.micChunksForwarded}` : ''}` +
+              `${typeof msg.msSinceLastMicForward === 'number' ? `, last mic chunk ${msg.msSinceLastMicForward}ms before` : ''}` +
+              `${bridgeToBrowserDelayMs !== null ? `, bridge→browser≈${bridgeToBrowserDelayMs}ms` : ''}`
           );
 
-          // Stop playback and invalidate exactly the interrupted generation.
-          // The gate advances to the server's next generation exactly once;
-          // the cancellation receives that invalidated set instead of
-          // transitioning the gate a second time.
+          if (bridgeToBrowserDelayMs !== null) {
+            setActiveSession((prev) =>
+              prev ? { ...prev, bridgeToBrowserInterruptionDelayMs: bridgeToBrowserDelayMs } : null
+            );
+          }
+
+          // Stop playback and invalidate the interrupted generation (plus any
+          // older generation still playing). The gate advances to the server's
+          // next generation exactly once; the cancellation receives that
+          // invalidated set instead of transitioning the gate a second time.
           const interruptionResult = gateRef.current.handleInterruption(
             msg.interruptedGenerationId,
             msg.nextGenerationId
           );
+
+          if (isDuplicate) {
+            // A repeat of an already-handled interruption must not reset the
+            // response-latency timer, flip the UI state, consume a generation,
+            // or touch playback metrics. The first event already invalidated
+            // every generation that was playing, so there is nothing left to
+            // stop here.
+            setActiveSession((prev) =>
+              prev
+                ? { ...prev, duplicateInterruptionEvents: prev.duplicateInterruptionEvents + 1 }
+                : null
+            );
+            return;
+          }
+
+          // Measure server-frame-received → silence inside the cancellation.
+          lastInterruptionMonoRef.current = performance.now();
           cancelAllAssistantAudio(
             'server_interrupted',
             msg.interruptedGenerationId,
@@ -1203,8 +1293,6 @@ export default function App() {
           updateAppState('interrupted', 'Model barge-in interruption triggered');
 
           setActiveGenerationId(interruptionResult.nextGenerationId);
-
-          lastInterruptionMonoRef.current = performance.now();
 
           // Interruption timing outcome
           const timingOutcome = localCancellationFiredRef.current
@@ -1216,8 +1304,14 @@ export default function App() {
               ? {
                   ...prev,
                   geminiInterruptionEventsReceived: prev.geminiInterruptionEventsReceived + 1,
+                  // The bridge counts unique interrupted generations; its
+                  // counter is authoritative because a local barge-in has
+                  // already invalidated the generation client-side.
                   uniqueGenerationsInterrupted:
-                    prev.uniqueGenerationsInterrupted + (interruptionResult.firstObservation ? 1 : 0),
+                    typeof msg.serverInterruptionCount === 'number'
+                      ? msg.serverInterruptionCount
+                      : prev.uniqueGenerationsInterrupted +
+                        (interruptionResult.firstObservation ? 1 : 0),
                   interruptionTimingOutcome: timingOutcome,
                 }
               : null
@@ -1230,13 +1324,20 @@ export default function App() {
           }
         } else if (msg.type === 'turn_complete') {
           const completedTurn = ledgerRef.current.get(msg.completedGenerationId);
-          const wasInterrupted = completedTurn?.status === 'interrupted';
+          const wasInterrupted =
+            completedTurn?.status === 'interrupted' || msg.closesInterruptedTurn === true;
           logEvent(
             'turn_complete',
             wasInterrupted
               ? `Turn closed after interruption (${msg.completedGenerationId})`
               : `Turn completed cleanly by Gemini Live API (${msg.completedGenerationId})`
           );
+          if (typeof msg.modelPartsDroppedAfterInterrupt === 'number' && msg.modelPartsDroppedAfterInterrupt > 0) {
+            logEvent(
+              'pipeline',
+              `${msg.modelPartsDroppedAfterInterrupt} stale content part(s) dropped after interruption (bridge)`
+            );
+          }
           const turnResult = gateRef.current.handleTurnComplete(
             msg.completedGenerationId,
             msg.nextGenerationId
@@ -1354,6 +1455,20 @@ export default function App() {
       setMicVolume(Math.min(100, Math.round(rms * 280)));
 
       const isSpeaking = rms > 0.025;
+
+      // Diagnostic: first frame of each local utterance. This timestamp is the
+      // reference for onset→silence (separate from server-reported timing).
+      if (isSpeaking && !speechActiveRef.current) {
+        speechActiveRef.current = true;
+        utteranceOnsetMonoRef.current = captureMono;
+        logEvent(
+          'pipeline',
+          `Local VAD onset (rms=${rms.toFixed(3)}, threshold=0.025)` +
+            `${gateRef.current.playbackCount() > 0 ? ' during assistant playback' : ''}`
+        );
+      } else if (!isSpeaking && speechActiveRef.current) {
+        speechActiveRef.current = false;
+      }
 
       // Local speech onset detection & barge-in tracking. Requiring a few
       // consecutive voiced frames (~96ms) prevents speaker echo/noise from
@@ -1940,14 +2055,19 @@ export default function App() {
           </div>
 
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 space-y-1">
-            <span className="text-[11px] text-slate-400 font-medium block">Cancel-to-Silence</span>
+            <span className="text-[11px] text-slate-400 font-medium block">Onset → Silence</span>
             <span className="text-sm font-mono font-bold text-rose-400 block">
-              {activeSession?.interruptionToStopDurationMs !== null &&
-              activeSession?.interruptionToStopDurationMs !== undefined
-                ? `${activeSession.interruptionToStopDurationMs} ms`
-                : '—'}
+              {activeSession?.localOnsetToPlaybackSilenceMs !== null &&
+              activeSession?.localOnsetToPlaybackSilenceMs !== undefined
+                ? `${activeSession.localOnsetToPlaybackSilenceMs} ms`
+                : activeSession?.serverInterruptionToPlaybackSilenceMs !== null &&
+                    activeSession?.serverInterruptionToPlaybackSilenceMs !== undefined
+                  ? `${activeSession.serverInterruptionToPlaybackSilenceMs} ms`
+                  : '—'}
             </span>
-            <span className="text-[10px] text-slate-500 block">Gain mute + queue purge</span>
+            <span className="text-[10px] text-slate-500 block">
+              VAD onset / server event → gain mute
+            </span>
           </div>
 
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-3.5 space-y-1">
@@ -2274,7 +2394,12 @@ export default function App() {
               </div>
               <div className="flex items-center justify-between p-2 rounded bg-slate-950/60 border border-slate-800/80">
                 <span className="text-slate-300">7. Interruption event delivered to browser</span>
-                <span className="text-rose-400">WebSocket frame tagged</span>
+                <span className="text-rose-400">
+                  {activeSession?.bridgeToBrowserInterruptionDelayMs !== null &&
+                  activeSession?.bridgeToBrowserInterruptionDelayMs !== undefined
+                    ? `≈${activeSession.bridgeToBrowserInterruptionDelayMs} ms bridge→browser`
+                    : 'WebSocket frame tagged'}
+                </span>
               </div>
               <div className="flex items-center justify-between p-2 rounded bg-slate-950/60 border border-slate-800/80">
                 <span className="text-slate-300">8. Browser receives & processes interruption event</span>

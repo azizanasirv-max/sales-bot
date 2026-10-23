@@ -144,6 +144,105 @@ export function generationOrdinal(generationId: string | null | undefined): numb
 }
 
 
+/* ------------------------------------------------------------------------- */
+/* Server-side generation attribution                                         */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The Live API documents an interruption as `interrupted` followed by
+ * `turnComplete` for the *same* turn ("When model is interrupted while
+ * generating there will be no 'generation_complete' message in interrupted
+ * turn, it will go through 'interrupted > turn_complete'").
+ *
+ * The bridge used to advance its generation counter on both events, so a
+ * single barge-in consumed two generation IDs: one for the interrupted turn
+ * and one empty "phantom" slot that the trailing `turnComplete` closed. When
+ * `turnComplete` had already advanced the counter while the client was still
+ * playing the generated audio, a later interruption was attributed to the
+ * empty slot and the audible generation was never stopped.
+ *
+ * This helper decides which generation an interruption really refers to:
+ * the last generation that produced content, not a reserved-but-empty slot.
+ */
+export interface InterruptionAttributionInput {
+  currentGenerationId: string;
+  /** Generation that last delivered audio or text, if any. */
+  lastContentGenerationId: string | null;
+  /** Generations already interrupted in this session. */
+  alreadyInterrupted: readonly string[];
+}
+
+export interface InterruptionAttribution {
+  interruptedGenerationId: string;
+  /** Whether a new generation slot must be reserved for the next response. */
+  advanceGeneration: boolean;
+  /** True when this event repeats an interruption already handled. */
+  duplicate: boolean;
+  firstObservation: boolean;
+}
+
+export function resolveInterruptionAttribution(
+  input: InterruptionAttributionInput
+): InterruptionAttribution {
+  const contentGenerationId = input.lastContentGenerationId;
+  // The current slot only owns the interruption when it actually produced
+  // content. Otherwise it is the reserved slot for the *next* response (a
+  // `turnComplete` already ran while the previous audio was still playing).
+  const attributedToCurrent =
+    contentGenerationId === null || contentGenerationId === input.currentGenerationId;
+  const interruptedGenerationId =
+    contentGenerationId !== null && contentGenerationId !== input.currentGenerationId
+      ? contentGenerationId
+      : input.currentGenerationId;
+
+  const duplicate = input.alreadyInterrupted.includes(interruptedGenerationId);
+  return {
+    interruptedGenerationId,
+    // Duplicates must not consume another slot: an interrupted turn produces
+    // exactly one interruption event for this application.
+    advanceGeneration: attributedToCurrent && !duplicate,
+    duplicate,
+    firstObservation: !duplicate,
+  };
+}
+
+export interface TurnCompletionInput {
+  currentGenerationId: string;
+  /** Whether the current (reserved) slot already delivered audio/text. */
+  currentHasContent: boolean;
+  /** Generation invalidated by the interruption that this turn_complete closes. */
+  interruptedGenerationId: string | null;
+}
+
+export interface TurnCompletion {
+  completedGenerationId: string;
+  advanceGeneration: boolean;
+  closesInterruptedTurn: boolean;
+}
+
+/**
+ * Decides which generation a `turnComplete` closes.
+ *
+ * After an interruption the API sends `turnComplete` for the interrupted turn,
+ * after the bridge has already reserved the next slot. That completion must
+ * name the interrupted generation and must not advance the counter again.
+ */
+export function resolveTurnCompletion(input: TurnCompletionInput): TurnCompletion {
+  if (input.interruptedGenerationId && !input.currentHasContent) {
+    return {
+      completedGenerationId: input.interruptedGenerationId,
+      advanceGeneration: false,
+      closesInterruptedTurn: true,
+    };
+  }
+  return {
+    completedGenerationId: input.currentGenerationId,
+    advanceGeneration: true,
+    closesInterruptedTurn: false,
+  };
+}
+
+
 export type AudioRejectionReason = 'invalidated' | 'stale';
 
 export interface AudioAcceptance {
@@ -335,6 +434,14 @@ export class ConversationGate {
   /**
    * Server-reported interruption. Invalidates exactly the generation the
    * server reported and adopts the server's next generation ID.
+   *
+   * A generation that is still scheduled for playback but is *older* than the
+   * interrupted one can only be the tail of an obsolete response: the answer to
+   * the interrupting utterance cannot reuse an earlier generation ID. Those
+   * tails must be stopped too, otherwise a barge-in whose interruption event is
+   * attributed to the server's newest (empty) slot leaves the audible tail of
+   * the previous turn playing. Newer generations are never touched: they may be
+   * the answer that already arrived out of order.
    */
   handleInterruption(
     interruptedGenerationId?: string | null,
@@ -346,6 +453,16 @@ export class ConversationGate {
       const alreadyKnown = this.invalidatedGenerations.has(interruptedGenerationId);
       if (this.addInvalidated(interruptedGenerationId)) invalidated.push(interruptedGenerationId);
       firstObservation = !alreadyKnown;
+
+      const interruptedOrdinal = generationOrdinal(interruptedGenerationId);
+      if (interruptedOrdinal !== null) {
+        for (const generationId of [...this.playingGenerations]) {
+          const ordinal = generationOrdinal(generationId);
+          if (ordinal !== null && ordinal < interruptedOrdinal) {
+            if (this.addInvalidated(generationId)) invalidated.push(generationId);
+          }
+        }
+      }
     }
     this.noteNextGeneration(nextGenerationId);
     return { invalidated, firstObservation, nextGenerationId: this.activeGenerationId };

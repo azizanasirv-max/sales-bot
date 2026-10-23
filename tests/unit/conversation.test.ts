@@ -5,8 +5,10 @@ import {
   TurnLedger,
   buildLanguageInstruction,
   composeSystemInstruction,
+  resolveInterruptionAttribution,
   resolveLanguagePreference,
   resolvePlaybackStopSet,
+  resolveTurnCompletion,
   shouldTriggerLocalBargeIn,
 } from '../../src/lib/conversation';
 
@@ -243,6 +245,190 @@ test('gate: reset isolates a new session from the previous invalidation set', ()
   assert.equal(gate.isInvalidated('gen_1'), false);
   // A new session restarts numbering at gen_1 server-side.
   assert.equal(gate.acceptAudio('gen_1').accepted, true);
+});
+
+test('gate: an interruption attributed to an empty slot still stops the audible tail', () => {
+  // Turn 1 finished generating (turn_complete -> gen_2) while its audio is
+  // still queued in the browser. The API then reports the user's barge-in for
+  // the current slot (gen_2), which never produced audio.
+  const gate = new ConversationGate();
+  gate.acceptAudio('gen_1');
+  gate.markPlaybackScheduled('gen_1');
+  gate.handleTurnComplete('gen_1', 'gen_2');
+
+  const result = gate.handleInterruption('gen_2', 'gen_3');
+
+  // The audible generation must be invalidated even though the server named
+  // the empty slot; otherwise playback continues after the interruption.
+  assert.equal(result.invalidated.includes('gen_1'), true);
+  assert.equal(gate.isInvalidated('gen_1'), true);
+  assert.equal(gate.playbackCount(), 0);
+  assert.equal(gate.acceptAudio('gen_1').accepted, false);
+});
+
+test('gate: an interruption never invalidates a newer generation that is already scheduled', () => {
+  const gate = new ConversationGate();
+  gate.acceptAudio('gen_1');
+  gate.markPlaybackScheduled('gen_1');
+  // Out-of-order delivery: the answer to the barge-in already arrived.
+  gate.acceptAudio('gen_2');
+  gate.markPlaybackScheduled('gen_2');
+
+  const result = gate.handleInterruption('gen_1', 'gen_2');
+
+  assert.deepEqual(result.invalidated, ['gen_1']);
+  assert.equal(gate.isInvalidated('gen_2'), false);
+  assert.equal(gate.isPlaying('gen_2'), true);
+  assert.equal(gate.acceptAudio('gen_2').accepted, true);
+});
+
+test('attribution: an interruption of the current content generation reserves one slot', () => {
+  const result = resolveInterruptionAttribution({
+    currentGenerationId: 'gen_3',
+    lastContentGenerationId: 'gen_3',
+    alreadyInterrupted: [],
+  });
+  assert.equal(result.interruptedGenerationId, 'gen_3');
+  assert.equal(result.advanceGeneration, true);
+  assert.equal(result.duplicate, false);
+});
+
+test('attribution: an interruption after turn_complete names the generation that was audible', () => {
+  const result = resolveInterruptionAttribution({
+    currentGenerationId: 'gen_3',
+    lastContentGenerationId: 'gen_2',
+    alreadyInterrupted: [],
+  });
+  assert.equal(result.interruptedGenerationId, 'gen_2');
+  // gen_3 is the reserved slot for the answer; it must not be consumed.
+  assert.equal(result.advanceGeneration, false);
+  assert.equal(result.duplicate, false);
+});
+
+test('attribution: duplicate interruptions are idempotent and consume no generation', () => {
+  const result = resolveInterruptionAttribution({
+    currentGenerationId: 'gen_3',
+    lastContentGenerationId: 'gen_2',
+    alreadyInterrupted: ['gen_2'],
+  });
+  assert.equal(result.interruptedGenerationId, 'gen_2');
+  assert.equal(result.advanceGeneration, false);
+  assert.equal(result.duplicate, true);
+  assert.equal(result.firstObservation, false);
+});
+
+test('attribution: an interruption before any content falls back to the current slot', () => {
+  const result = resolveInterruptionAttribution({
+    currentGenerationId: 'gen_1',
+    lastContentGenerationId: null,
+    alreadyInterrupted: [],
+  });
+  assert.equal(result.interruptedGenerationId, 'gen_1');
+  assert.equal(result.advanceGeneration, true);
+});
+
+test('turn completion: the turn_complete after an interruption closes that turn, not the reserved slot', () => {
+  const result = resolveTurnCompletion({
+    currentGenerationId: 'gen_2',
+    currentHasContent: false,
+    interruptedGenerationId: 'gen_1',
+  });
+  assert.equal(result.completedGenerationId, 'gen_1');
+  assert.equal(result.advanceGeneration, false);
+  assert.equal(result.closesInterruptedTurn, true);
+});
+
+test('turn completion: a turn that produced content advances exactly once', () => {
+  const result = resolveTurnCompletion({
+    currentGenerationId: 'gen_2',
+    currentHasContent: true,
+    interruptedGenerationId: null,
+  });
+  assert.equal(result.completedGenerationId, 'gen_2');
+  assert.equal(result.advanceGeneration, true);
+  assert.equal(result.closesInterruptedTurn, false);
+});
+test('generation lifecycle: documented interrupted > turn_complete order advances once per turn', () => {
+  // Mirrors the bridge state machine using the same pure helpers.
+  let current = 'gen_1';
+  let lastContent: string | null = null;
+  let interrupted: string | null = null;
+  const interruptedGenerations: string[] = [];
+  const advance = () => {
+    current = `gen_${Number(current.split('_')[1]) + 1}`;
+  };
+  const deliverContent = () => {
+    lastContent = current;
+  };
+  const completeTurn = () => {
+    const completion = resolveTurnCompletion({
+      currentGenerationId: current,
+      currentHasContent: lastContent === current,
+      interruptedGenerationId: interrupted,
+    });
+    interrupted = null;
+    if (completion.advanceGeneration) advance();
+    return completion;
+  };
+  const interrupt = () => {
+    const attribution = resolveInterruptionAttribution({
+      currentGenerationId: current,
+      lastContentGenerationId: lastContent,
+      alreadyInterrupted: interruptedGenerations,
+    });
+    if (!attribution.duplicate) {
+      interruptedGenerations.push(attribution.interruptedGenerationId);
+      interrupted = attribution.interruptedGenerationId;
+    }
+    if (attribution.advanceGeneration) advance();
+    return attribution;
+  };
+
+  deliverContent();
+  assert.deepEqual(completeTurn(), {
+    completedGenerationId: 'gen_1',
+    advanceGeneration: true,
+    closesInterruptedTurn: false,
+  });
+  assert.equal(current, 'gen_2');
+
+  // The user interrupts the tail that is still playing after turn_complete.
+  const tail = interrupt();
+  assert.equal(tail.interruptedGenerationId, 'gen_1');
+  assert.equal(tail.advanceGeneration, false);
+  assert.equal(current, 'gen_2');
+  // Same generation is reported twice: the second event is a duplicate.
+  assert.equal(interrupt().duplicate, true);
+  assert.equal(current, 'gen_2');
+  assert.deepEqual(completeTurn(), {
+    completedGenerationId: 'gen_1',
+    advanceGeneration: false,
+    closesInterruptedTurn: true,
+  });
+  assert.equal(current, 'gen_2');
+
+  // The answer to the barge-in uses the reserved slot and advances once.
+  deliverContent();
+  assert.deepEqual(completeTurn(), {
+    completedGenerationId: 'gen_2',
+    advanceGeneration: true,
+    closesInterruptedTurn: false,
+  });
+  assert.equal(current, 'gen_3');
+
+  // Mid-generation interruption: one slot is reserved, turn_complete closes
+  // the interrupted turn without consuming the reserved slot.
+  deliverContent();
+  const mid = interrupt();
+  assert.equal(mid.interruptedGenerationId, 'gen_3');
+  assert.equal(mid.advanceGeneration, true);
+  assert.equal(current, 'gen_4');
+  assert.deepEqual(completeTurn(), {
+    completedGenerationId: 'gen_3',
+    advanceGeneration: false,
+    closesInterruptedTurn: true,
+  });
+  assert.equal(current, 'gen_4');
 });
 
 test('gate: teardown blocks every late chunk', () => {
