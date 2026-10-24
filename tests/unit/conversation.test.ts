@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   ConversationGate,
   TurnLedger,
+  CustomerTranscriptLedger,
+  SalesSuggestionLedger,
   buildLanguageInstruction,
   composeSystemInstruction,
   resolveLanguagePreference,
@@ -315,6 +317,103 @@ test('ledger: clear isolates sessions', () => {
   ledger.clear();
   assert.equal(ledger.size(), 0);
   assert.equal(ledger.get('gen_1'), null);
+});
+
+test('customer transcript ledger: tracks interim and appends deduplicated final utterances', () => {
+  const ledger = new CustomerTranscriptLedger(5);
+  ledger.setInterim('I am looking for');
+  assert.equal(ledger.getInterim(), 'I am looking for');
+
+  // Add finalized utterance
+  const first = ledger.addFinal('I am looking for pricing information.');
+  assert.equal(first.added, true);
+  assert.equal(ledger.getInterim(), null);
+  assert.equal(ledger.getEntries().length, 1);
+  assert.equal(ledger.getEntries()[0].text, 'I am looking for pricing information.');
+
+  // Immediate identical duplicate is ignored
+  const dup = ledger.addFinal('I am looking for pricing information.');
+  assert.equal(dup.added, false);
+  assert.equal(ledger.getEntries().length, 1);
+
+  // New distinct utterance is appended
+  const second = ledger.addFinal('Do you have enterprise discounts?');
+  assert.equal(second.added, true);
+  assert.equal(ledger.getEntries().length, 2);
+});
+
+test('customer transcript ledger: respects max entries bounding and clears cleanly', () => {
+  const ledger = new CustomerTranscriptLedger(3);
+  ledger.addFinal('Utterance 1');
+  ledger.addFinal('Utterance 2');
+  ledger.addFinal('Utterance 3');
+  ledger.addFinal('Utterance 4');
+
+  const entries = ledger.getEntries();
+  assert.equal(entries.length, 3);
+  assert.equal(entries[0].text, 'Utterance 2');
+  assert.equal(entries[2].text, 'Utterance 4');
+
+  ledger.clear();
+  assert.equal(ledger.getEntries().length, 0);
+  assert.equal(ledger.getInterim(), null);
+});
+
+test('sales suggestion ledger: accumulates streaming deltas per generation and completes turn', () => {
+  const ledger = new SalesSuggestionLedger(10);
+  const chunk1 = ledger.appendDelta('gen_1', 'Ask if they are considering');
+  assert.equal(chunk1.created, true);
+  assert.equal(ledger.getLatest()?.status, 'streaming');
+  assert.equal(ledger.getLatest()?.text, 'Ask if they are considering');
+
+  const chunk2 = ledger.appendDelta('gen_1', ' annual billing for a discount.');
+  assert.equal(chunk2.created, false);
+  assert.equal(ledger.getLatest()?.text, 'Ask if they are considering annual billing for a discount.');
+
+  // Complete turn
+  const comp = ledger.completeTurn('gen_1');
+  assert.ok(comp);
+  assert.equal(comp?.status, 'completed');
+  assert.equal(ledger.getLatest()?.status, 'completed');
+  assert.equal(ledger.get('gen_1')?.status, 'completed');
+});
+
+test('sales suggestion ledger: handles mid-turn customer interruption cleanly', () => {
+  const ledger = new SalesSuggestionLedger(10);
+  ledger.appendDelta('gen_1', 'Start offering standard 10% discount');
+  assert.equal(ledger.getLatest()?.status, 'streaming');
+
+  // Customer interrupts mid-generation
+  const intr = ledger.interruptTurn('gen_1', 'gen_2');
+  assert.ok(intr);
+  assert.equal(intr?.status, 'interrupted');
+  assert.equal(ledger.get('gen_1')?.status, 'interrupted');
+
+  // Late delta for an already-interrupted generation does not revert status to streaming
+  ledger.appendDelta('gen_1', ' and free onboarding');
+  assert.equal(ledger.get('gen_1')?.status, 'interrupted');
+
+  // Next generation starts cleanly
+  ledger.appendDelta('gen_2', 'Acknowledge custom SLA requirement.');
+  assert.equal(ledger.getLatest()?.generationId, 'gen_2');
+  assert.equal(ledger.getLatest()?.status, 'streaming');
+  assert.equal(ledger.getAll().length, 2);
+});
+
+test('sales suggestion ledger: bounds entries to maxEntries and clears cleanly', () => {
+  const ledger = new SalesSuggestionLedger(2);
+  ledger.appendDelta('gen_1', 'Suggestion 1');
+  ledger.appendDelta('gen_2', 'Suggestion 2');
+  ledger.appendDelta('gen_3', 'Suggestion 3');
+
+  const all = ledger.getAll();
+  assert.equal(all.length, 2);
+  assert.equal(all[0].generationId, 'gen_3');
+  assert.equal(all[1].generationId, 'gen_2');
+
+  ledger.clear();
+  assert.equal(ledger.getAll().length, 0);
+  assert.equal(ledger.getLatest(), null);
 });
 
 

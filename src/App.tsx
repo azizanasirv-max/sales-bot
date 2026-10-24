@@ -15,10 +15,14 @@ import {
   ConversationGate,
   SUPPORTED_LANGUAGES,
   TurnLedger,
+  CustomerTranscriptLedger,
+  SalesSuggestionLedger,
   resolvePlaybackStopSet,
   shouldTriggerLocalBargeIn,
   type CancellationReason,
   type LedgerTurn,
+  type CustomerTranscriptEntry,
+  type SalesSuggestionEntry,
 } from './lib/conversation';
 import { loadStoredLanguage, storeLanguage } from './lib/languagePreference';
 import { buildDiagnosticsReport } from './lib/diagnostics';
@@ -51,6 +55,9 @@ import {
   Sliders,
   History,
   Timer,
+  MessageSquare,
+  User,
+  Lightbulb,
 } from 'lucide-react';
 
 export type AppState =
@@ -110,6 +117,8 @@ export interface SessionDiagnostics {
   interruptionToStopDurationMs: number | null;
   interruptionToNextResponseAudibleMs: number | null;
   firstAudioLatencyMs: number | null;
+  firstCustomerTranscriptLatencyMs: number | null;
+  firstSalesSuggestionLatencyMs: number | null;
 
   // Packet counters (Strictly isolated per session)
   micChunksCaptured: number;
@@ -120,6 +129,7 @@ export interface SessionDiagnostics {
   modelChunksDeliveredClient: number;
   modelChunksScheduled: number;
   modelChunksRendered: number;
+  audioPacketsDiscardedServer: number;
 
   // Interruption accounting
   userSpeechOnsetDetections: number;
@@ -136,6 +146,7 @@ export interface SessionDiagnostics {
     totalTokenCount?: number;
     cachedContentTokenCount?: number;
     thoughtsTokenCount?: number;
+    audioPacketsDiscarded?: number;
   } | null;
 }
 
@@ -195,14 +206,21 @@ export default function App() {
     message: string;
     instruction?: string;
   } | null>(null);
-  const [activeTab, setActiveTab] = useState<'conversation' | 'diagnostics' | 'pipeline' | 'guide'>(
-    'conversation'
-  );
+  const [activeTab, setActiveTab] = useState<
+    'workspace' | 'conversation' | 'diagnostics' | 'pipeline' | 'guide'
+  >('workspace');
   const [copiedLogs, setCopiedLogs] = useState<boolean>(false);
+  const [copiedSuggestionId, setCopiedSuggestionId] = useState<string | null>(null);
 
   // Conversation history and events (isolated to current session)
   const [turns, setTurns] = useState<TurnRecord[]>([]);
   const [events, setEvents] = useState<DiagnosticEvent[]>([]);
+
+  // Customer Transcript & Sales Copilot Suggestion States
+  const [customerEntries, setCustomerEntries] = useState<CustomerTranscriptEntry[]>([]);
+  const [customerInterim, setCustomerInterim] = useState<string | null>(null);
+  const [salesSuggestions, setSalesSuggestions] = useState<SalesSuggestionEntry[]>([]);
+  const [latestSuggestion, setLatestSuggestion] = useState<SalesSuggestionEntry | null>(null);
 
   // Web Audio & WebSocket References
   const wsRef = useRef<WebSocket | null>(null);
@@ -213,9 +231,11 @@ export default function App() {
   const outputGainRef = useRef<GainNode | null>(null);
   const outputAnalyserRef = useRef<AnalyserNode | null>(null);
 
-  // Generation ID tracking & invalidation
+  // Generation ID tracking & ledgers
   const gateRef = useRef<ConversationGate>(new ConversationGate());
   const ledgerRef = useRef<TurnLedger>(new TurnLedger());
+  const customerLedgerRef = useRef<CustomerTranscriptLedger>(new CustomerTranscriptLedger(100));
+  const salesLedgerRef = useRef<SalesSuggestionLedger>(new SalesSuggestionLedger(50));
   const activeSourcesRef = useRef<
     Array<{ node: AudioBufferSourceNode; generationId: string; endTime: number }>
   >([]);
@@ -797,13 +817,19 @@ export default function App() {
     rejectedGenerationLoggedRef.current = new Set();
     gateRef.current.reset();
     ledgerRef.current.clear();
+    customerLedgerRef.current.clear();
+    salesLedgerRef.current.clear();
     generationGainsRef.current.clear();
     activeSourcesRef.current = [];
     nextPlayTimeRef.current = 0;
 
-    // Reset turns & events for clean session isolation
+    // Reset turns, customer transcripts & sales suggestions for clean session isolation
     setTurns([]);
     setEvents([]);
+    setCustomerEntries([]);
+    setCustomerInterim(null);
+    setSalesSuggestions([]);
+    setLatestSuggestion(null);
 
     const initialDiagnostics: SessionDiagnostics = {
       sessionId: newSessionId,
@@ -820,6 +846,8 @@ export default function App() {
       interruptionToStopDurationMs: null,
       interruptionToNextResponseAudibleMs: null,
       firstAudioLatencyMs: null,
+      firstCustomerTranscriptLatencyMs: null,
+      firstSalesSuggestionLatencyMs: null,
       micChunksCaptured: 0,
       micChunksSent: 0,
       micChunksReceivedBridge: 0,
@@ -828,6 +856,7 @@ export default function App() {
       modelChunksDeliveredClient: 0,
       modelChunksScheduled: 0,
       modelChunksRendered: 0,
+      audioPacketsDiscardedServer: 0,
       userSpeechOnsetDetections: 0,
       localPlaybackCancellations: 0,
       geminiInterruptionEventsReceived: 0,
@@ -869,43 +898,26 @@ export default function App() {
       return;
     }
 
-    // 2. Setup Web Audio Contexts
+    // 2. Setup Web Audio Input Context for continuous microphone capture (Strictly No Output Playback)
     let inputCtx: AudioContext;
-    let outputCtx: AudioContext;
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      // A 16kHz context avoids resampling on capture, but not every browser
-      // accepts a forced sample rate. Fall back to the hardware default; the
-      // capture path resamples to 16k anyway.
       try {
         inputCtx = new AudioCtx({ sampleRate: 16000 });
       } catch {
         logEvent('info', '16kHz AudioContext unsupported; using the default sample rate.');
         inputCtx = new AudioCtx();
       }
-      outputCtx = new AudioCtx();
 
       if (inputCtx.state === 'suspended') await inputCtx.resume();
-      if (outputCtx.state === 'suspended') await outputCtx.resume();
-
       inputAudioCtxRef.current = inputCtx;
-      outputAudioCtxRef.current = outputCtx;
-      nextPlayTimeRef.current = outputCtx.currentTime;
-
-      const outputGain = outputCtx.createGain();
-      const outputAnalyser = outputCtx.createAnalyser();
-      outputAnalyser.fftSize = 256;
-      outputGain.connect(outputAnalyser);
-      outputAnalyser.connect(outputCtx.destination);
-      outputGainRef.current = outputGain;
-      outputAnalyserRef.current = outputAnalyser;
     } catch (audioCtxErr: any) {
       console.error('[AudioContext Error]:', audioCtxErr);
       logEvent('error', `AudioContext error: ${audioCtxErr.message}`, audioCtxErr);
       setErrorDetails({
         code: 'AUDIO_CONTEXT_FAILED',
-        message: 'Could not initialize browser Web Audio context.',
-        instruction: 'Ensure your audio output device is enabled and refresh the browser.',
+        message: 'Could not initialize browser Web Audio input context.',
+        instruction: 'Ensure microphone permissions are granted and refresh the browser.',
       });
       updateAppState('api_error', 'AudioContext failed');
       cleanupAudioPipeline();
@@ -1007,11 +1019,61 @@ export default function App() {
             `Server signalled session expiry (timeLeft=${msg.timeLeft ?? 'unknown'}); a resume will follow.`
           );
         } else if (msg.type === 'transcription') {
-          logEvent(
-            'info',
-            `${msg.direction === 'output' ? 'Assistant' : 'User'} transcript: "${msg.text}"`,
-            { direction: msg.direction }
-          );
+          if (msg.direction === 'input') {
+            // Customer Speech Transcript
+            if (msg.isFinal) {
+              const res = customerLedgerRef.current.addFinal(msg.text, msgRecvMono);
+              setCustomerEntries(customerLedgerRef.current.getEntries());
+              setCustomerInterim(null);
+              if (res.added) {
+                logEvent('info', `Customer utterance finalized: "${msg.text}"`);
+                if (userSpeechOnsetMonoRef.current) {
+                  const custLatency = Math.round(msgRecvMono - userSpeechOnsetMonoRef.current);
+                  setActiveSession((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          firstCustomerTranscriptLatencyMs:
+                            prev.firstCustomerTranscriptLatencyMs ?? custLatency,
+                        }
+                      : null
+                  );
+                }
+              }
+            } else {
+              customerLedgerRef.current.setInterim(msg.text);
+              setCustomerInterim(msg.text);
+            }
+          } else if (msg.direction === 'output') {
+            // Private Sales Copilot Suggestion (from Gemini outputAudioTranscription)
+            const genId = msg.generationId || gateRef.current.getActiveGenerationId();
+            let latencyMs: number | undefined;
+            if (userSpeechOnsetMonoRef.current) {
+              latencyMs = Math.round(msgRecvMono - userSpeechOnsetMonoRef.current);
+              userSpeechOnsetMonoRef.current = null;
+            }
+            const res = salesLedgerRef.current.appendDelta(genId, msg.text, {
+              latencyMs,
+              monoTime: msgRecvMono,
+            });
+            if (res.created) {
+              logEvent('info', `New sales suggestion started [Gen: ${genId}]`);
+              setActiveSession((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      firstSalesSuggestionLatencyMs:
+                        prev.firstSalesSuggestionLatencyMs ?? (latencyMs ?? null),
+                    }
+                  : null
+              );
+            }
+            setSalesSuggestions(salesLedgerRef.current.getAll());
+            setLatestSuggestion(salesLedgerRef.current.getLatest());
+            // Also maintain legacy ledger for diagnostic turn snapshot
+            ledgerRef.current.appendText(genId, msg.text);
+            setTurns(ledgerRef.current.snapshot());
+          }
         } else if (msg.type === 'status') {
           if (msg.state === 'disconnected') {
             updateAppState('disconnected', 'Session disconnected');
@@ -1030,167 +1092,28 @@ export default function App() {
               : null
           );
         } else if (msg.type === 'audio') {
-          // Central generation gate: drops stale/interrupted chunks without
-          // ever dropping the pending generation that answers a barge-in.
-          const acceptance = gateRef.current.acceptAudio(msg.generationId);
-          if (!acceptance.accepted) {
-            const key = `${msg.generationId}:${acceptance.reason}`;
-            if (!rejectedGenerationLoggedRef.current.has(key)) {
-              rejectedGenerationLoggedRef.current.add(key);
-              logEvent(
-                'pipeline',
-                `Dropped ${acceptance.reason} audio chunk from generation ${msg.generationId}`
-              );
-            }
-            return;
-          }
-          const activeGen = acceptance.generationId;
-          setActiveGenerationId(activeGen);
-
-          // Stage 12: First new response audio arrives from Gemini
-          if (lastInterruptionMonoRef.current) {
-            const timeToRecv = Math.round((msgRecvMono - lastInterruptionMonoRef.current) * 10) / 10;
-            logEvent('pipeline', `First response audio packet received after interruption (${timeToRecv}ms)`);
-          }
-
-          updateAppState('receiving_audio', 'Receiving assistant audio chunk');
-
-          // First audio latency measurement
-          let firstAudioLatencyMs: number | undefined;
-          if (userSpeechOnsetMonoRef.current) {
-            firstAudioLatencyMs = Math.round(msgRecvMono - userSpeechOnsetMonoRef.current);
-            setActiveSession((prev) =>
-              prev ? { ...prev, firstAudioLatencyMs: firstAudioLatencyMs! } : null
-            );
-            userSpeechOnsetMonoRef.current = null;
-          }
-
-          // Decode and queue 24kHz PCM chunk
-          if (outputCtx && outputGainRef.current && msg.data) {
-            // Browsers can suspend the context (tab backgrounding, iOS audio
-            // policy). Scheduling into a suspended context produces silence
-            // until it is resumed, so nudge it on every first chunk.
-            if (outputCtx.state === 'suspended') {
-              void outputCtx.resume().catch(() => {
-                /* resume will be retried with the next chunk */
-              });
-            }
-            const float32Samples = base64PCMToFloat32(msg.data);
-            const durationSec = float32Samples.length / 24000;
-
-            setActiveSession((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    modelChunksDeliveredClient: prev.modelChunksDeliveredClient + 1,
-                    modelChunksScheduled: prev.modelChunksScheduled + 1,
-                  }
-                : null
-            );
-
-            const { created } = ledgerRef.current.addAudio(activeGen, durationSec * 1000, {
-              latencyMs: firstAudioLatencyMs,
-            });
-            if (created) {
-              // A new assistant turn is starting; local barge-in is armed again.
-              localCancellationFiredRef.current = false;
-              logEvent('turn_complete', `New assistant turn started [Gen: ${activeGen}]`);
-            }
-            setTurns(ledgerRef.current.snapshot());
-
-            const audioBuffer = outputCtx.createBuffer(1, float32Samples.length, 24000);
-            audioBuffer.getChannelData(0).set(float32Samples);
-
-            // Dedicated gain node for this generation for airtight acoustic isolation
-            if (!generationGainsRef.current.has(activeGen)) {
-              const g = outputCtx.createGain();
-              g.gain.setValueAtTime(1, outputCtx.currentTime);
-              g.connect(outputGainRef.current);
-              generationGainsRef.current.set(activeGen, g);
-            }
-            const currentGenGain = generationGainsRef.current.get(activeGen)!;
-
-            const source = outputCtx.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(currentGenGain);
-
-            const currentTime = outputCtx.currentTime;
-            if (nextPlayTimeRef.current < currentTime) {
-              nextPlayTimeRef.current = currentTime + 0.005; // Tight 5ms buffer
-            }
-
-            // Stage 13: Calculate when this chunk becomes audible
-            const timeUntilAudibleMs = Math.max(0, (nextPlayTimeRef.current - currentTime) * 1000);
-            if (lastInterruptionMonoRef.current) {
-              const totalToAudible = Math.round(msgRecvMono - lastInterruptionMonoRef.current + timeUntilAudibleMs);
-              setActiveSession((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      interruptionToNextResponseAudibleMs: totalToAudible,
-                    }
-                  : null
-              );
-              lastInterruptionMonoRef.current = null;
-            }
-
-            gateRef.current.markPlaybackScheduled(activeGen);
-            const sourceStartTime = nextPlayTimeRef.current;
-            source.start(sourceStartTime);
-            const sourceEndTime = sourceStartTime + audioBuffer.duration;
-            nextPlayTimeRef.current = sourceEndTime;
-
-            activeSourcesRef.current.push({
-              node: source,
-              generationId: activeGen,
-              endTime: sourceEndTime,
-            });
-
-            source.onended = () => {
-              const idx = activeSourcesRef.current.findIndex((entry) => entry.node === source);
-              if (idx !== -1) {
-                activeSourcesRef.current.splice(idx, 1);
-              }
-              gateRef.current.markPlaybackEnded(activeGen);
-              setActiveSession((prev) =>
-                prev ? { ...prev, modelChunksRendered: prev.modelChunksRendered + 1 } : null
-              );
-              if (activeSourcesRef.current.length === 0) {
-                // Release gain nodes that can no longer be needed. Keeping them
-                // around leaked nodes across long sessions and cross-session
-                // reuse is what previously silenced a restarted session.
-                for (const [gen, gainNode] of generationGainsRef.current.entries()) {
-                  if (gen === gateRef.current.getActiveGenerationId()) continue;
-                  try {
-                    gainNode.disconnect();
-                  } catch {
-                    /* detached */
-                  }
-                  generationGainsRef.current.delete(gen);
+          // Strict No-Audio-Playback: Any audio payload arriving from server is dropped immediately.
+          setActiveSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  modelChunksDeliveredClient: prev.modelChunksDeliveredClient + 1,
                 }
-                if (
-                  appStateRef.current === 'receiving_audio' ||
-                  appStateRef.current === 'ready_for_conversation'
-                ) {
-                  updateAppState('ready_for_conversation', 'Assistant audio playback finished');
-                }
-                setOutputVolume(0);
-              }
-            };
-          }
+              : null
+          );
+          logEvent(
+            'pipeline',
+            `Discarded server audio chunk [${msg.generationId}] (No-Audio-Playback mode enforced)`
+          );
+          return;
         } else if (msg.type === 'interrupted') {
-          // Stage 6, 7 & 8: Interruption event delivered to browser
           const interruptedGen =
             msg.interruptedGenerationId || gateRef.current.getActiveGenerationId();
           logEvent(
             'interrupted',
-            `⚡ Gemini Live server reported interruption of ${interruptedGen} (Stage 6–8)`
+            `⚡ Gemini Live reported interruption of ${interruptedGen} (Stage 6–8)`
           );
 
-          // Stop playback and invalidate exactly the interrupted generation.
-          // The gate advances to the server's next generation exactly once;
-          // the cancellation receives that invalidated set instead of
-          // transitioning the gate a second time.
           const interruptionResult = gateRef.current.handleInterruption(
             msg.interruptedGenerationId,
             msg.nextGenerationId
@@ -1200,13 +1123,16 @@ export default function App() {
             msg.interruptedGenerationId,
             interruptionResult.invalidated
           );
-          updateAppState('interrupted', 'Model barge-in interruption triggered');
+          updateAppState('interrupted', 'Customer resumed speaking; suggestion updated');
 
           setActiveGenerationId(interruptionResult.nextGenerationId);
-
           lastInterruptionMonoRef.current = performance.now();
 
-          // Interruption timing outcome
+          // Transition suggestion ledger state for interrupted generation
+          salesLedgerRef.current.interruptTurn(interruptedGen, interruptionResult.nextGenerationId);
+          setSalesSuggestions(salesLedgerRef.current.getAll());
+          setLatestSuggestion(salesLedgerRef.current.getLatest());
+
           const timingOutcome = localCancellationFiredRef.current
             ? 'stopped_locally_before_server'
             : 'stopped_on_server_event';
@@ -1224,51 +1150,75 @@ export default function App() {
           );
 
           localCancellationFiredRef.current = false;
-
           if (ledgerRef.current.interrupt(msg.interruptedGenerationId)) {
             setTurns(ledgerRef.current.snapshot());
           }
         } else if (msg.type === 'turn_complete') {
-          const completedTurn = ledgerRef.current.get(msg.completedGenerationId);
+          const completedGen = msg.completedGenerationId;
+          const nextGen = msg.nextGenerationId;
+          const completedTurn = ledgerRef.current.get(completedGen);
           const wasInterrupted = completedTurn?.status === 'interrupted';
+
           logEvent(
             'turn_complete',
             wasInterrupted
-              ? `Turn closed after interruption (${msg.completedGenerationId})`
-              : `Turn completed cleanly by Gemini Live API (${msg.completedGenerationId})`
+              ? `Turn closed after interruption (${completedGen})`
+              : `Sales suggestion turn completed cleanly (${completedGen})`
           );
-          const turnResult = gateRef.current.handleTurnComplete(
-            msg.completedGenerationId,
-            msg.nextGenerationId
-          );
-          // A new turn boundary re-arms local barge-in handling.
+
+          const turnResult = gateRef.current.handleTurnComplete(completedGen, nextGen);
           localCancellationFiredRef.current = false;
           setActiveGenerationId(turnResult.nextGenerationId);
+
+          salesLedgerRef.current.completeTurn(completedGen);
+          setSalesSuggestions(salesLedgerRef.current.getAll());
+          setLatestSuggestion(salesLedgerRef.current.getLatest());
+
           setActiveSession((prev) =>
             prev
               ? {
                   ...prev,
                   completedTurns: prev.completedTurns + (wasInterrupted ? 0 : 1),
+                  audioPacketsDiscardedServer:
+                    msg.audioPacketsDiscarded !== undefined
+                      ? msg.audioPacketsDiscarded
+                      : prev.audioPacketsDiscardedServer,
                 }
               : null
           );
-          // Close the turn the event actually refers to, not whichever turn
-          // happens to be newest (a late completion can arrive after a new
-          // response started).
-          if (ledgerRef.current.complete(msg.completedGenerationId)) {
+
+          if (ledgerRef.current.complete(completedGen)) {
             setTurns(ledgerRef.current.snapshot());
           }
+          if (appStateRef.current === 'receiving_audio' || appStateRef.current === 'streaming_mic') {
+            updateAppState('ready_for_conversation', 'Ready for next customer statement');
+          }
         } else if (msg.type === 'text') {
-          if (msg.generationId && gateRef.current.isInvalidated(msg.generationId)) {
+          const genId = msg.generationId || gateRef.current.getActiveGenerationId();
+          if (genId && gateRef.current.isInvalidated(genId)) {
             return;
           }
-          logEvent('audio_out', `Transcript text from model: "${msg.text}"`);
-          if (msg.generationId && ledgerRef.current.appendText(msg.generationId, msg.text)) {
+          logEvent('audio_out', `Suggestion text from model: "${msg.text}"`);
+          const res = salesLedgerRef.current.appendDelta(genId, msg.text, {
+            monoTime: msgRecvMono,
+          });
+          setSalesSuggestions(salesLedgerRef.current.getAll());
+          setLatestSuggestion(salesLedgerRef.current.getLatest());
+          if (genId && ledgerRef.current.appendText(genId, msg.text)) {
             setTurns(ledgerRef.current.snapshot());
           }
         } else if (msg.type === 'usage') {
           logEvent('usage', `Usage metadata: ${JSON.stringify(msg.usage)}`);
-          setActiveSession((prev) => (prev ? { ...prev, usageMetadata: msg.usage } : null));
+          setActiveSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  usageMetadata: msg.usage,
+                  audioPacketsDiscardedServer:
+                    msg.usage?.audioPacketsDiscarded ?? prev.audioPacketsDiscardedServer,
+                }
+              : null
+          );
         } else if (msg.type === 'error') {
           logEvent('error', `API error: ${msg.error}`, msg);
           let instr = 'Check diagnostic events for raw details.';
@@ -1475,6 +1425,16 @@ export default function App() {
     setTimeout(() => setCopiedLogs(false), 2000);
   };
 
+  const copySuggestionText = async (id: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedSuggestionId(id);
+      setTimeout(() => setCopiedSuggestionId(null), 2000);
+    } catch (e) {
+      console.error('Failed to copy suggestion text', e);
+    }
+  };
+
   const formatSeconds = (sec: number) => {
     const m = Math.floor(sec / 60);
     const s = sec % 60;
@@ -1484,13 +1444,13 @@ export default function App() {
   const getStateBadge = () => {
     switch (appState) {
       case 'ready_for_conversation':
-        return { label: 'Ready for Conversation', color: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30', dot: 'bg-emerald-400' };
+        return { label: 'Listening / Copilot Ready', color: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30', dot: 'bg-emerald-400' };
       case 'streaming_mic':
-        return { label: 'Streaming User Audio', color: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30', dot: 'bg-cyan-400 animate-pulse' };
+        return { label: 'Streaming Customer Audio', color: 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30', dot: 'bg-cyan-400 animate-pulse' };
       case 'receiving_audio':
-        return { label: 'Receiving Assistant Audio', color: 'bg-purple-500/10 text-purple-400 border-purple-500/30', dot: 'bg-purple-400 animate-pulse' };
+        return { label: 'Generating Sales Guidance', color: 'bg-purple-500/10 text-purple-400 border-purple-500/30', dot: 'bg-purple-400 animate-pulse' };
       case 'interrupted':
-        return { label: 'Interruption Handled', color: 'bg-rose-500/10 text-rose-400 border-rose-500/30', dot: 'bg-rose-400 animate-ping' };
+        return { label: 'Customer Resumed Speaking', color: 'bg-rose-500/10 text-rose-400 border-rose-500/30', dot: 'bg-rose-400 animate-ping' };
       case 'reconnecting':
         return { label: 'Reconnecting Session...', color: 'bg-amber-500/10 text-amber-300 border-amber-500/30', dot: 'bg-amber-400 animate-pulse' };
       case 'connecting':
@@ -1539,7 +1499,7 @@ export default function App() {
             <div>
               <div className="flex items-center gap-2">
                 <h1 className="text-base sm:text-lg font-bold tracking-tight text-white">
-                  Gemini Live Voice Tester
+                  Gemini Live Sales Copilot
                 </h1>
                 <span className="text-xs px-2 py-0.5 rounded-full font-mono bg-indigo-500/10 text-indigo-400 border border-indigo-500/30">
                   {modelId}
@@ -1557,7 +1517,7 @@ export default function App() {
                 </span>
               </div>
               <p className="text-xs text-slate-400 hidden sm:block">
-                Full-duplex real-time audio • 32ms chunk cadence • Instant barge-in cancellation
+                Audio-In / Text-Out Sales Assistant • Continuous Customer Mic Stream • Zero Browser Audio Playback
               </p>
             </div>
           </div>
@@ -1678,12 +1638,12 @@ export default function App() {
                 {appState === 'connecting' || appState === 'mic_permission_pending' ? (
                   <>
                     <RefreshCw className="w-5 h-5 animate-spin" />
-                    <span>Connecting Session...</span>
+                    <span>Connecting Copilot...</span>
                   </>
                 ) : (
                   <>
                     <PhoneCall className="w-5 h-5" />
-                    <span>Start Conversation</span>
+                    <span>Start Sales Copilot</span>
                   </>
                 )}
               </button>
@@ -1693,7 +1653,7 @@ export default function App() {
                 className="flex items-center justify-center gap-2.5 px-6 py-3.5 rounded-xl bg-rose-600 hover:bg-rose-500 active:bg-rose-700 text-white font-semibold text-sm transition shadow-lg shadow-rose-600/30 cursor-pointer"
               >
                 <PhoneOff className="w-5 h-5" />
-                <span>End Conversation</span>
+                <span>End Copilot Session</span>
               </button>
             )}
 
@@ -1711,10 +1671,10 @@ export default function App() {
               <span>{isTestingMic ? 'Stop Mic Test' : 'Test Mic Hardware'}</span>
             </button>
 
-            {/* Voice Persona Selector */}
-            <div className="flex items-center gap-2 bg-slate-950/60 border border-slate-800 rounded-xl px-3 py-2.5">
+            {/* Voice Tone Profile Selector */}
+            <div className="flex items-center gap-2 bg-slate-950/60 border border-slate-800 rounded-xl px-3 py-2.5" title="Model voice persona (audio is discarded on server; suggestions streamed as text)">
               <label htmlFor="voice-select" className="text-xs text-slate-400 font-medium">
-                Voice:
+                Tone Persona:
               </label>
               <select
                 id="voice-select"
@@ -1826,84 +1786,77 @@ export default function App() {
             </p>
           </div>
 
-          {/* Model Spoken Audio Status & Output Wave / VU Meter */}
+          {/* Sales Copilot Engine Status & Zero-Playback Accounting */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 flex flex-col justify-between gap-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
                 <div
                   className={`w-9 h-9 rounded-xl flex items-center justify-center ${
-                    appState === 'receiving_audio'
-                      ? 'bg-purple-500/20 text-purple-400 border border-purple-500/40 animate-pulse'
+                    latestSuggestion?.status === 'streaming'
+                      ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 animate-pulse'
+                      : isSessionActive
+                      ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/40'
                       : 'bg-slate-800 text-slate-500'
                   }`}
                 >
-                  <Volume2 className="w-4 h-4" />
+                  <Sparkles className="w-4 h-4" />
                 </div>
                 <div>
-                  <h2 className="text-sm font-semibold text-white">Model Response Output</h2>
+                  <h2 className="text-sm font-semibold text-white">Sales Copilot Guidance Engine</h2>
                   <p className="text-xs text-slate-400">
-                    {appState === 'receiving_audio'
-                      ? `Synthesizing ${activeGenerationId} native 24kHz speech`
-                      : activeSession && activeSession.uniqueGenerationsInterrupted > 0
-                      ? `Interruption handled on ${activeSession.interruptionTimingOutcome}`
+                    {latestSuggestion?.status === 'streaming'
+                      ? `Generating private suggestion [${activeGenerationId}]`
+                      : latestSuggestion?.status === 'interrupted'
+                      ? `Interrupted by customer [${activeGenerationId}]`
                       : isSessionActive
-                      ? 'Awaiting user input'
-                      : 'Inactive'}
+                      ? 'Listening to customer speech...'
+                      : 'Audio-in / text-out standby'}
                   </p>
                 </div>
               </div>
               <span
                 className={`text-xs px-2.5 py-0.5 rounded font-mono ${
-                  appState === 'receiving_audio'
-                    ? 'bg-purple-500/20 text-purple-300 font-bold border border-purple-500/30 animate-pulse'
-                    : activeSession && activeSession.uniqueGenerationsInterrupted > 0
+                  latestSuggestion?.status === 'streaming'
+                    ? 'bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/30 animate-pulse'
+                    : latestSuggestion?.status === 'interrupted'
                     ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                    : isSessionActive
+                    ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
                     : 'bg-slate-800 text-slate-400'
                 }`}
               >
-                {appState === 'receiving_audio'
-                  ? 'SPEAKING'
-                  : activeSession && activeSession.uniqueGenerationsInterrupted > 0
+                {latestSuggestion?.status === 'streaming'
+                  ? 'STREAMING GUIDANCE'
+                  : latestSuggestion?.status === 'interrupted'
                   ? 'INTERRUPTED'
+                  : isSessionActive
+                  ? 'LISTENING'
                   : 'IDLE'}
               </span>
             </div>
 
-            {/* Model Output VU Meter */}
-            <div className="space-y-1.5">
-              <div className="flex justify-between text-[11px] text-slate-400 font-mono">
-                <span>Synthesized Output Level</span>
-                <span>{outputVolume}%</span>
+            {/* Zero-Audio Playback & Copilot Metrics */}
+            <div className="grid grid-cols-2 gap-2 text-xs font-mono">
+              <div className="p-2 rounded-lg bg-slate-950/70 border border-slate-800">
+                <span className="text-[10px] text-slate-500 block">Server Audio Discarded</span>
+                <span className="text-emerald-400 font-bold">
+                  {activeSession?.audioPacketsDiscardedServer || 0} chunks (0s audio played)
+                </span>
               </div>
-              <div className="h-3.5 bg-slate-950 rounded-full overflow-hidden p-0.5 border border-slate-800">
-                <div
-                  className="h-full rounded-full transition-all duration-75 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500"
-                  style={{ width: `${outputVolume}%` }}
-                />
+              <div className="p-2 rounded-lg bg-slate-950/70 border border-slate-800">
+                <span className="text-[10px] text-slate-500 block">First Suggestion Latency</span>
+                <span className="text-indigo-300 font-bold">
+                  {activeSession?.firstSalesSuggestionLatencyMs !== null &&
+                  activeSession?.firstSalesSuggestionLatencyMs !== undefined
+                    ? `${activeSession.firstSalesSuggestionLatencyMs} ms`
+                    : '—'}
+                </span>
               </div>
             </div>
 
-            {/* Interruption Status Banner */}
-            {activeSession && activeSession.uniqueGenerationsInterrupted > 0 ? (
-              <div className="p-2 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs flex items-center justify-between">
-                <div className="flex items-center gap-1.5">
-                  <Zap className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                  <span>
-                    Barge-in handled ({activeSession.interruptionTimingOutcome})! Stop duration:{' '}
-                    {activeSession.interruptionToStopDurationMs !== null
-                      ? `${activeSession.interruptionToStopDurationMs}ms`
-                      : '<1ms'}
-                  </span>
-                </div>
-                <span className="font-mono text-[10px] text-rose-400">
-                  Gen Interrupted: {activeSession.uniqueGenerationsInterrupted}
-                </span>
-              </div>
-            ) : (
-              <p className="text-[11px] text-slate-500">
-                Speak while the assistant is responding to trigger server-authoritative barge-in interruption.
-              </p>
-            )}
+            <p className="text-[11px] text-slate-500">
+              Zero-Audio-Playback active: Model responses are received via output transcriptions and shown privately. No synthetic audio is synthesized or played in the browser.
+            </p>
           </div>
         </section>
 
@@ -2047,48 +2000,290 @@ export default function App() {
         </section>
 
         {/* Tabs */}
-        <div className="flex items-center border-b border-slate-800 gap-2">
+        <div className="flex items-center border-b border-slate-800 gap-2 overflow-x-auto pb-px">
+          <button
+            onClick={() => setActiveTab('workspace')}
+            className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer whitespace-nowrap flex items-center gap-1.5 ${
+              activeTab === 'workspace'
+                ? 'border-indigo-500 text-indigo-400'
+                : 'border-transparent text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>Sales Copilot Workspace</span>
+            {salesSuggestions.length > 0 && (
+              <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-indigo-500/20 text-indigo-300 font-mono">
+                {salesSuggestions.length}
+              </span>
+            )}
+          </button>
           <button
             onClick={() => setActiveTab('conversation')}
-            className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer ${
+            className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer whitespace-nowrap ${
               activeTab === 'conversation'
                 ? 'border-indigo-500 text-indigo-400'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            Conversation Log ({turns.length})
+            Turns Log ({turns.length})
           </button>
           <button
             onClick={() => setActiveTab('diagnostics')}
-            className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer ${
+            className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer whitespace-nowrap ${
               activeTab === 'diagnostics'
                 ? 'border-indigo-500 text-indigo-400'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            Diagnostics & Event Stream ({events.length})
+            Diagnostics ({events.length})
           </button>
           <button
             onClick={() => setActiveTab('pipeline')}
-            className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer ${
+            className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer whitespace-nowrap ${
               activeTab === 'pipeline'
                 ? 'border-indigo-500 text-indigo-400'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            13-Stage Pipeline Breakdown
+            13-Stage Pipeline
           </button>
           <button
             onClick={() => setActiveTab('guide')}
-            className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer ${
+            className={`px-4 py-2.5 text-xs font-semibold border-b-2 transition cursor-pointer whitespace-nowrap ${
               activeTab === 'guide'
                 ? 'border-indigo-500 text-indigo-400'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            Interruption Test Protocol
+            Testing Protocol
           </button>
         </div>
+
+        {/* Tab 0: Sales Copilot Workspace (Live Audio-In / Text-Out Dual Stream) */}
+        {activeTab === 'workspace' && (
+          <section className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
+            {/* Left Column: Customer Speech Live Transcript */}
+            <div className="lg:col-span-5 flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <User className="w-4 h-4 text-cyan-400" />
+                  <h3 className="text-sm font-bold text-white tracking-tight">Customer Live Speech</h3>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                    {customerEntries.length} finalized
+                  </span>
+                </div>
+                {customerEntries.length > 0 && (
+                  <button
+                    onClick={() => {
+                      customerLedgerRef.current.clear();
+                      setCustomerEntries([]);
+                      setCustomerInterim(null);
+                    }}
+                    className="text-[11px] text-slate-400 hover:text-slate-200 cursor-pointer"
+                  >
+                    Clear transcript
+                  </button>
+                )}
+              </div>
+
+              {/* Interim Live Speech Bubble (Pulsing feedback as words are spoken) */}
+              {customerInterim && (
+                <div className="p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-500/40 text-indigo-200 text-xs shadow-lg space-y-1 animate-pulse">
+                  <div className="flex items-center justify-between text-[11px] text-indigo-300">
+                    <span className="flex items-center gap-1.5 font-semibold">
+                      <Radio className="w-3.5 h-3.5 text-indigo-400 animate-spin" />
+                      Customer Speaking (Interim Hypothesis)...
+                    </span>
+                    <span className="font-mono text-[10px] text-indigo-400">Live</span>
+                  </div>
+                  <p className="font-medium text-white italic tracking-wide break-words">{customerInterim}</p>
+                </div>
+              )}
+
+              {/* Finalized Utterances List */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 sm:p-4 min-h-[380px] max-h-[620px] overflow-y-auto space-y-2.5">
+                {customerEntries.length === 0 && !customerInterim ? (
+                  <div className="h-72 flex flex-col items-center justify-center text-center p-6 space-y-3">
+                    <div className="w-12 h-12 rounded-2xl bg-slate-800/80 border border-slate-700/60 flex items-center justify-center text-slate-500">
+                      <Mic className="w-6 h-6" />
+                    </div>
+                    <div className="space-y-1">
+                      <p className="text-xs font-semibold text-slate-300">Awaiting customer microphone audio</p>
+                      <p className="text-[11px] text-slate-500 max-w-xs leading-relaxed">
+                        Start the copilot session and speak. The customer&apos;s speech is transcribed in real-time and streamed incrementally.
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  customerEntries.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="p-3 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-1 transition hover:border-slate-700"
+                    >
+                      <div className="flex items-center justify-between text-[10px] text-slate-500 font-mono">
+                        <span className="text-cyan-400 font-semibold">Utterance #{entry.id.replace('cust_', '')}</span>
+                        <span>{new Date(entry.timestampUtc).toLocaleTimeString()}</span>
+                      </div>
+                      <p className="text-xs text-slate-200 leading-relaxed break-words">{entry.text}</p>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Right Column: Private Sales Suggestions */}
+            <div className="lg:col-span-7 flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Lightbulb className="w-4 h-4 text-amber-400" />
+                  <h3 className="text-sm font-bold text-white tracking-tight">Private Sales Guidance</h3>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                    Audio Discarded (Text Only)
+                  </span>
+                </div>
+                {latestSuggestion && (
+                  <button
+                    onClick={() => copySuggestionText(latestSuggestion.id, latestSuggestion.text)}
+                    className="flex items-center gap-1 text-[11px] px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition cursor-pointer"
+                  >
+                    {copiedSuggestionId === latestSuggestion.id ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span className="text-emerald-300">Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>Copy Suggestion</span>
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+
+              {/* Primary Active Suggestion Card */}
+              <div
+                className={`rounded-2xl p-5 border transition shadow-xl space-y-4 ${
+                  latestSuggestion?.status === 'streaming'
+                    ? 'bg-slate-900/90 border-indigo-500/50 ring-1 ring-indigo-500/30'
+                    : latestSuggestion?.status === 'interrupted'
+                    ? 'bg-rose-950/20 border-rose-800/60'
+                    : latestSuggestion?.status === 'completed'
+                    ? 'bg-slate-900 border-slate-700/80'
+                    : 'bg-slate-900/60 border-slate-800'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-3">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold text-white">Active Recommendation</span>
+                    {latestSuggestion && (
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                        Gen: {latestSuggestion.generationId}
+                      </span>
+                    )}
+                  </div>
+                  <div>
+                    {latestSuggestion?.status === 'streaming' ? (
+                      <span className="px-2.5 py-0.5 rounded text-[11px] font-mono font-semibold bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 flex items-center gap-1.5 animate-pulse">
+                        <RefreshCw className="w-3 h-3 animate-spin" />
+                        Streaming suggestions...
+                      </span>
+                    ) : latestSuggestion?.status === 'completed' ? (
+                      <span className="px-2.5 py-0.5 rounded text-[11px] font-mono font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center gap-1">
+                        <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                        Ready to Say
+                      </span>
+                    ) : latestSuggestion?.status === 'interrupted' ? (
+                      <span className="px-2.5 py-0.5 rounded text-[11px] font-mono font-semibold bg-rose-500/20 text-rose-300 border border-rose-500/40 flex items-center gap-1">
+                        <Zap className="w-3 h-3 text-rose-400" />
+                        Interrupted (Customer Resumed)
+                      </span>
+                    ) : (
+                      <span className="text-[11px] text-slate-500 font-mono">Idle</span>
+                    )}
+                  </div>
+                </div>
+
+                {latestSuggestion?.text ? (
+                  <div className="space-y-3">
+                    <div className="text-sm sm:text-base text-slate-100 font-sans leading-relaxed whitespace-pre-wrap selection:bg-indigo-600">
+                      {latestSuggestion.text}
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between pt-2 border-t border-slate-800/60 text-[11px] text-slate-400 font-mono">
+                      <span>
+                        Updated:{' '}
+                        {new Date(
+                          latestSuggestion.completedAtUtc || latestSuggestion.createdAtUtc
+                        ).toLocaleTimeString()}
+                      </span>
+                      {latestSuggestion.latencyMs !== undefined && (
+                        <span className="text-emerald-400">
+                          Initial generation latency: {latestSuggestion.latencyMs}ms
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="py-12 text-center space-y-2">
+                    <Sparkles className="w-8 h-8 text-slate-600 mx-auto" />
+                    <p className="text-xs font-semibold text-slate-300">No active suggestion</p>
+                    <p className="text-[11px] text-slate-500 max-w-md mx-auto">
+                      As the customer speaks, Gemini Live will analyze their intent and stream concise, actionable sales advice directly to this card.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Previous Suggestions History Feed */}
+              {salesSuggestions.length > 1 && (
+                <div className="space-y-2 pt-2">
+                  <div className="flex items-center justify-between text-xs text-slate-400 font-semibold px-1">
+                    <span className="flex items-center gap-1.5">
+                      <History className="w-3.5 h-3.5 text-slate-400" />
+                      Earlier Suggestions ({salesSuggestions.length - 1})
+                    </span>
+                  </div>
+                  <div className="space-y-2 max-h-72 overflow-y-auto">
+                    {salesSuggestions.slice(1).map((sug) => (
+                      <div
+                        key={sug.id}
+                        className={`p-3.5 rounded-xl border text-xs space-y-2 transition ${
+                          sug.status === 'interrupted'
+                            ? 'bg-slate-950/40 border-rose-950/50 text-slate-300'
+                            : 'bg-slate-950/60 border-slate-800 text-slate-200'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between text-[10px] font-mono text-slate-500">
+                          <div className="flex items-center gap-2">
+                            <span className="font-semibold text-slate-400">Gen: {sug.generationId}</span>
+                            <span>•</span>
+                            <span>
+                              {new Date(
+                                sug.completedAtUtc || sug.createdAtUtc
+                              ).toLocaleTimeString()}
+                            </span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {sug.status === 'interrupted' && (
+                              <span className="text-rose-400">Interrupted</span>
+                            )}
+                            <button
+                              onClick={() => copySuggestionText(sug.id, sug.text)}
+                              className="hover:text-slate-300 cursor-pointer text-[10px] text-slate-400"
+                            >
+                              {copiedSuggestionId === sug.id ? 'Copied' : 'Copy'}
+                            </button>
+                          </div>
+                        </div>
+                        <p className="leading-relaxed whitespace-pre-wrap">{sug.text}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </section>
+        )}
 
         {/* Tab 1: Conversation Log */}
         {activeTab === 'conversation' && (

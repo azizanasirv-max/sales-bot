@@ -50,9 +50,24 @@ export function supportsSpeechLanguageCode(model: string): boolean {
 
 
 export const DEFAULT_SYSTEM_INSTRUCTION =
-  'You are a real-time voice testing assistant. Keep your spoken responses natural, expressive, and concise (1-3 sentences) so the user can easily evaluate speech quality, latency, and barge-in interruption.';
+  'You are a private real-time sales copilot assisting a salesperson during a live customer call. ' +
+  'The customer cannot hear you; your response is displayed as private text on the salesperson\'s screen. ' +
+  'Guidelines: ' +
+  '1. Analyze the customer\'s statements, questions, objections, and buying signals. ' +
+  '2. Provide concise, actionable suggestions the salesperson can say aloud or use immediately. ' +
+  '3. Suggest relevant, probing clarification questions when the customer\'s need or situation is ambiguous. ' +
+  '4. Never invent prices, product specs, guarantees, discounts, or policies. State clearly if details need verification. ' +
+  '5. Keep recommendations punchy and direct (1-3 bullet points or short talking points). Avoid greetings, pleasantries, repetitive echoing, or conversational filler.';
 
 const MODEL_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Returns true if a model is documented and verified to support text-only response modality
+ * in the Live API. Native audio models like gemini-3.8-live reject Modality.TEXT with error 1007.
+ */
+export function supportsTextResponseModality(model: string): boolean {
+  return !isNativeAudioModel(model) && !model.toLowerCase().includes('live');
+}
 
 /**
  * The model actually used by the bridge. `GEMINI_LIVE_MODEL` allows operators
@@ -126,19 +141,16 @@ export interface LiveConfigInput {
 }
 
 /**
- * Builds the Live API session config.
+ * Builds the Live API session config for the audio-in/text-out Sales Copilot.
  *
  * Notes:
- *  - `speechConfig.languageCode` is only sent for models where Google
- *    documents support for it (legacy half-cascade Live models). Native-audio
- *    models such as `gemini-3.8-live` choose the language themselves and do not
- *    support an explicit code; for those the (always supported) system
- *    instruction is the only language lever.
- *  - `contextWindowCompression.slidingWindow` keeps long sessions (5+ minutes)
- *    from hitting the context limit.
- *  - `sessionResumption` is only given a handle when reconnecting, so a first
- *    connection never resumes an unrelated session. An empty object opts the
- *    session into `sessionResumptionUpdate` frames.
+ *  - `responseModalities: [Modality.AUDIO]` is preserved because `gemini-3.8-live`
+ *    requires audio response modality and rejects `[Modality.TEXT]` with API error 1007.
+ *  - `inputAudioTranscription: {}` enables real-time customer speech-to-text.
+ *  - `outputAudioTranscription: {}` enables incremental text transcription of Gemini's
+ *    generated response, which is surfaced as private text suggestions for the salesperson.
+ *  - The server bridge filters out generated audio packets before browser delivery,
+ *    ensuring zero synthetic speech reaches browser playback.
  */
 export function buildLiveConfig(input: LiveConfigInput): LiveConnectConfig {
   const voiceName = (input.voice || '').trim() || 'Puck';
@@ -160,6 +172,8 @@ export function buildLiveConfig(input: LiveConfigInput): LiveConnectConfig {
     contextWindowCompression: {
       slidingWindow: {},
     },
+    inputAudioTranscription: {},
+    outputAudioTranscription: {},
   };
 
   if (input.language.code && languageCodeSupported) {

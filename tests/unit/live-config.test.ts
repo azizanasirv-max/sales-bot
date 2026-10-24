@@ -9,6 +9,7 @@ import {
   resolveLiveModel,
   resolveServerApiKey,
   supportsSpeechLanguageCode,
+  supportsTextResponseModality,
   validateStartRequest,
 } from '../../src/lib/liveConfig';
 import { resolveLanguagePreference } from '../../src/lib/conversation';
@@ -76,6 +77,12 @@ test('live config: voice and language instruction are wired for the native-audio
   const config = buildLiveConfig({ voice: 'Kore', language, model: 'gemini-3.8-live' });
 
   assert.deepEqual(config.responseModalities, ['AUDIO']);
+  // Sales copilot enables input audio transcription for customer speech
+  // and output audio transcription for private text guidance.
+  assert.deepEqual(config.inputAudioTranscription, {});
+  assert.deepEqual(config.outputAudioTranscription, {});
+  // Gemini Live does not support responseModalities: [TEXT]
+  assert.equal(supportsTextResponseModality('gemini-3.8-live'), false);
   // Google documents that native-audio models choose the language themselves
   // and do not support an explicit language code.
   assert.equal(config.speechConfig?.languageCode, undefined);

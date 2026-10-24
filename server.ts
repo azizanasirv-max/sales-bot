@@ -179,6 +179,7 @@ interface LiveSessionContext {
   micChunksDropped: number;
   modelChunksReceived: number;
   modelChunksDelivered: number;
+  modelChunksDropped: number;
   serverInterruptionEventsCount: number;
   completedTurnsCount: number;
   lastUsageMetadata: Record<string, unknown> | null;
@@ -237,6 +238,7 @@ function createSessionContext(
     micChunksDropped: 0,
     modelChunksReceived: 0,
     modelChunksDelivered: 0,
+    modelChunksDropped: 0,
     serverInterruptionEventsCount: 0,
     completedTurnsCount: 0,
     lastUsageMetadata: null,
@@ -434,19 +436,10 @@ function handleServerMessage(
     for (const part of modelTurn.parts) {
       if (part.inlineData?.data) {
         ctx.modelChunksReceived += 1;
-        ctx.modelChunksDelivered += 1;
-        ctx.chunkSeqInGeneration += 1;
-        sendToClient(ctx, {
-          type: 'audio',
-          sessionId: ctx.id,
-          generationId: ctx.currentGenerationId,
-          chunkSeq: ctx.chunkSeqInGeneration,
-          data: part.inlineData.data,
-          mimeType: part.inlineData.mimeType || 'audio/pcm;rate=24000',
-          bridgeRecvMono: recvMono,
-          bridgeSentMono: performance.now(),
-          serverUtc: recvUtc,
-        });
+        // Strict no-audio-playback requirement for Sales Copilot:
+        // Do not forward generated audio payloads to the client.
+        // We filter out generated audio packets before browser delivery.
+        ctx.modelChunksDropped += 1;
       }
       if (part.text) {
         sendToClient(ctx, {
@@ -469,7 +462,7 @@ function handleServerMessage(
     nextGeneration(ctx);
     console.log(
       `[Live WS] Turn complete [${ctx.id}] ${completedGen} -> ${ctx.currentGenerationId} ` +
-        `(turns=${ctx.completedTurnsCount})`
+        `(turns=${ctx.completedTurnsCount}, audioDiscarded=${ctx.modelChunksDropped})`
     );
     sendToClient(ctx, {
       type: 'turn_complete',
@@ -477,6 +470,7 @@ function handleServerMessage(
       completedGenerationId: completedGen,
       nextGenerationId: ctx.currentGenerationId,
       completedTurnsCount: ctx.completedTurnsCount,
+      audioPacketsDiscarded: ctx.modelChunksDropped,
       serverMono: recvMono,
       serverUtc: recvUtc,
     });
@@ -490,6 +484,7 @@ function handleServerMessage(
       totalTokenCount: message.usageMetadata.totalTokenCount,
       cachedContentTokenCount: (message.usageMetadata as any).cachedContentTokenCount,
       thoughtsTokenCount: (message.usageMetadata as any).thoughtsTokenCount,
+      audioPacketsDiscarded: ctx.modelChunksDropped,
     };
     sendToClient(ctx, {
       type: 'usage',
@@ -502,25 +497,43 @@ function handleServerMessage(
     });
   }
 
-  // Transcripts are forwarded when the model/session provides them. They are
-  // additive diagnostics (e.g. to verify language stability in AI Studio).
+  // Transcripts are forwarded as structured events.
+  // 1. Customer speech: low-latency interim hypothesis while actively speaking
+  const interimInputTranscription = (serverContent as any)?.interimInputTranscription?.text;
+  if (interimInputTranscription) {
+    sendToClient(ctx, {
+      type: 'transcription',
+      sessionId: ctx.id,
+      direction: 'input',
+      isFinal: false,
+      text: interimInputTranscription,
+      serverMono: recvMono,
+      serverUtc: recvUtc,
+    });
+  }
+
+  // 2. Customer speech: finalized utterance segment
   const inputTranscription = serverContent?.inputTranscription?.text;
   if (inputTranscription) {
     sendToClient(ctx, {
       type: 'transcription',
       sessionId: ctx.id,
       direction: 'input',
+      isFinal: true,
       text: inputTranscription,
       serverMono: recvMono,
       serverUtc: recvUtc,
     });
   }
+
+  // 3. Private sales copilot suggestions: generated response text from Gemini
   const outputTranscription = serverContent?.outputTranscription?.text;
   if (outputTranscription) {
     sendToClient(ctx, {
       type: 'transcription',
       sessionId: ctx.id,
       direction: 'output',
+      generationId: ctx.currentGenerationId,
       text: outputTranscription,
       serverMono: recvMono,
       serverUtc: recvUtc,
