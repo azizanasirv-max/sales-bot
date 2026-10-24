@@ -6,13 +6,12 @@ import dotenv from 'dotenv';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, type LiveServerMessage, type Session } from '@google/genai';
 import {
-  INITIAL_GENERATION_ID,
   isStaleTransportEpoch,
-  resolveInterruptionAttribution,
   resolveLanguagePreference,
-  resolveTurnCompletion,
   type LanguagePreference,
 } from './src/lib/conversation';
+import { GenerationLifecycle, mapServerContent } from './src/lib/generationLifecycle';
+import { PreReadyAudioBuffer } from './src/lib/audioIngest';
 import {
   DEFAULT_SYSTEM_INSTRUCTION,
   buildLiveConfig,
@@ -172,32 +171,28 @@ interface LiveSessionContext {
   lastError: string | null;
   failureReported: boolean;
 
-  generationCounter: number;
-  currentGenerationId: string;
-  chunkSeqInGeneration: number;
-  interruptedGenerations: Set<string>;
   /**
-   * Generation that last delivered content (audio or text). The Live API's
-   * `interrupted` flag refers to the response being produced, which is not
-   * always `currentGenerationId`: after `turnComplete` the bridge has already
-   * reserved the next (content-less) slot.
+   * Single authority for generation IDs and interruption/completion state.
+   * Replaces the previously duplicated ctx fields so the bridge, the unit tests
+   * and the frame mapper all read the same lifecycle.
    */
-  lastContentGenerationId: string | null;
-  /** Interrupted generation whose trailing `turnComplete` is still expected. */
-  interruptedGenerationId: string | null;
-  /** Generations whose terminal event has already been applied. */
-  closedGenerations: Set<string>;
-  /** Content parts dropped because they arrived with an interruption flag. */
+  generations: GenerationLifecycle;
+  /**
+   * Audio captured before the first `setupComplete` of this context. Bounded and
+   * FIFO; flushed in order once the session becomes ready, cleared on teardown.
+   */
+  preReadyAudio: PreReadyAudioBuffer;
   modelPartsDroppedAfterInterrupt: number;
+  outputTranscriptionsDropped: number;
 
   micChunksReceived: number;
   micChunksForwarded: number;
   micChunksDropped: number;
+  micChunksBuffered: number;
+  micChunksFlushed: number;
   modelChunksReceived: number;
   modelChunksDelivered: number;
   modelChunksDropped: number;
-  serverInterruptionEventsCount: number;
-  completedTurnsCount: number;
   lastUsageMetadata: Record<string, unknown> | null;
 }
 
@@ -245,22 +240,18 @@ function createSessionContext(
     pendingResume: false,
     lastError: null,
     failureReported: false,
-    generationCounter: 0,
-    currentGenerationId: INITIAL_GENERATION_ID,
-    chunkSeqInGeneration: 0,
-    interruptedGenerations: new Set<string>(),
-    lastContentGenerationId: null,
-    interruptedGenerationId: null,
-    closedGenerations: new Set<string>(),
+    generations: new GenerationLifecycle(),
+    preReadyAudio: new PreReadyAudioBuffer(),
     modelPartsDroppedAfterInterrupt: 0,
+    outputTranscriptionsDropped: 0,
     micChunksReceived: 0,
     micChunksForwarded: 0,
     micChunksDropped: 0,
+    micChunksBuffered: 0,
+    micChunksFlushed: 0,
     modelChunksReceived: 0,
     modelChunksDelivered: 0,
     modelChunksDropped: 0,
-    serverInterruptionEventsCount: 0,
-    completedTurnsCount: 0,
     lastUsageMetadata: null,
   };
 }
@@ -287,13 +278,6 @@ function sendToClient(ctx: LiveSessionContext, payload: Record<string, unknown>)
  */
 function isCurrentConnection(ctx: LiveSessionContext, epoch: number): boolean {
   return isCurrent(ctx) && !isStaleTransportEpoch(ctx.connectionEpoch, epoch);
-}
-
-function nextGeneration(ctx: LiveSessionContext): string {
-  ctx.generationCounter += 1;
-  ctx.currentGenerationId = `gen_${ctx.generationCounter}`;
-  ctx.chunkSeqInGeneration = 0;
-  return ctx.currentGenerationId;
 }
 
 /**
@@ -346,11 +330,17 @@ function closeSession(ctx: LiveSessionContext, reason: string): void {
       console.error(`[Live WS] Error closing Gemini session [${ctx.id}]:`, err?.message || err);
     }
   }
+  ctx.preReadyAudio.clear();
+  const audioStats = ctx.preReadyAudio.stats();
   console.log(
     `[Live WS] Session closed [${ctx.id}] reason="${reason}" ` +
       `mic=${ctx.micChunksForwarded}/${ctx.micChunksReceived} ` +
-      `modelChunks=${ctx.modelChunksDelivered} interruptions=${ctx.serverInterruptionEventsCount} ` +
-      `turns=${ctx.completedTurnsCount}`
+      `buffered=${ctx.micChunksBuffered} flushed=${ctx.micChunksFlushed} ` +
+      `micDropped=${ctx.micChunksDropped} ` +
+      `preReadyDiscardedOnClose=${audioStats.discardedOnClear} ` +
+      `modelChunks=${ctx.modelChunksDelivered} interruptions=${ctx.generations.interruptionCount} ` +
+      `turns=${ctx.generations.completedTurns} ` +
+      `lateText=${ctx.outputTranscriptionsDropped}`
   );
   if (sessionBySocket.get(ctx.clientWs) === ctx) sessionBySocket.delete(ctx.clientWs);
 }
@@ -383,9 +373,19 @@ function handleServerMessage(
     ctx.reconnecting = false;
     ctx.resumeScheduled = false;
     ctx.reconnectAttempts = 0;
+
+    // Flush microphone audio captured while the session was being established,
+    // in capture order. Never on a resume: audio from before a transport gap is
+    // stale speech and must not be replayed into the resumed VAD context.
+    const flushed = wasResuming ? null : flushPreReadyAudio(ctx);
+
     console.log(
       `[Live WS] Gemini Live ${wasResuming ? 'resumed' : 'ready'} [${ctx.id}] ` +
-        `model=${ctx.model} language=${ctx.language.code ?? 'auto'} voice=${ctx.voice}`
+        `model=${ctx.model} language=${ctx.language.code ?? 'auto'} voice=${ctx.voice}` +
+        (flushed
+          ? ` bufferedFlush=${flushed.flushed}/${flushed.chunks} span=${flushed.spanMs}ms ` +
+            `dropped=${flushed.dropped}`
+          : '')
     );
     sendToClient(ctx, {
       type: wasResuming ? 'session_reconnected' : 'session_ready',
@@ -395,6 +395,11 @@ function handleServerMessage(
       language: { code: ctx.language.code, label: ctx.language.label },
       contextPreserved: wasResuming,
       resumed: wasResuming,
+      // Pre-ready buffering diagnostics (reconstructed Stage 1/3 behaviour).
+      bufferedAudioChunksAccepted: ctx.micChunksBuffered,
+      bufferedAudioChunksFlushed: flushed?.flushed ?? 0,
+      bufferedAudioChunksDropped: flushed?.dropped ?? 0,
+      bufferedAudioSpanMs: flushed?.spanMs ?? 0,
       serverMono: recvMono,
       serverUtc: recvUtc,
       sessionStartTimeUtc: ctx.startedAtUtc,
@@ -422,136 +427,50 @@ function handleServerMessage(
     }
   }
 
-  // Stage C: interruption attribution.
+  // Stage B/C/D: model content, interruption attribution and turn completion.
   //
-  // The API reports `interrupted` for the turn that was being produced, then
-  // closes that turn with `turnComplete`. `ctx.currentGenerationId` may already
-  // be a reserved, content-less slot because an earlier `turnComplete` advanced
-  // it. Attribute the interruption to the generation that actually produced
-  // content, reserve at most one new slot, and treat repeats as duplicates.
-  const interruptedInFrame = Boolean(serverContent?.interrupted);
-  if (interruptedInFrame) {
-    const attribution = resolveInterruptionAttribution({
-      currentGenerationId: ctx.currentGenerationId,
-      lastContentGenerationId: ctx.lastContentGenerationId,
-      alreadyInterrupted: [...ctx.interruptedGenerations],
-    });
-    const interruptedGen = attribution.interruptedGenerationId;
-
-    if (!attribution.duplicate) {
-      ctx.interruptedGenerations.add(interruptedGen);
-      ctx.serverInterruptionEventsCount += 1;
-      ctx.interruptedGenerationId = interruptedGen;
-    }
-    // Reserve the next slot once per interrupted turn. A duplicate event must
-    // not consume another generation ID.
-    if (attribution.advanceGeneration) nextGeneration(ctx);
-
-    console.log(
-      `[Live WS] Interruption [${ctx.id}] ${interruptedGen} -> ${ctx.currentGenerationId}` +
-        `${attribution.duplicate ? ' (duplicate event)' : ''}`
-    );
-    sendToClient(ctx, {
-      type: 'interrupted',
+  // The shared lifecycle owns the generation state machine, so the bridge, the
+  // client-facing frames and the tests cannot drift apart. `mapServerContent`
+  // emits frames in wire order: interrupted → model text → transcripts →
+  // turn_complete (terminal last, after the content it closes).
+  if (serverContent) {
+    const mapped = mapServerContent(serverContent, ctx.generations, {
       sessionId: ctx.id,
-      interruptedGenerationId: interruptedGen,
-      nextGenerationId: ctx.currentGenerationId,
-      duplicate: attribution.duplicate,
-      serverInterruptionCount: ctx.serverInterruptionEventsCount,
-      bridgeInterruptedRecvMono: recvMono,
-      bridgeInterruptedRecvUtc: recvUtc,
-      bridgeInterruptedSentMono: performance.now(),
-    });
-  }
-
-  // Generation that owns any content in this frame. `turnComplete` advances
-  // `currentGenerationId` later in the same message, so it must be captured now.
-  let frameGenerationId = ctx.currentGenerationId;
-
-  // Stage B: model turn content (24kHz PCM chunks & text transcript)
-  const modelTurn = serverContent?.modelTurn;
-  if (modelTurn?.parts?.length) {
-    if (interruptedInFrame) {
-      // Content coalesced with the interruption flag is the stale tail of the
-      // interrupted response: the answer to the interrupting utterance cannot
-      // exist yet. Forwarding it under the freshly reserved generation ID
-      // would attribute obsolete text to the next turn.
-      ctx.modelPartsDroppedAfterInterrupt += modelTurn.parts.length;
-      ctx.modelChunksReceived += modelTurn.parts.filter((part) => part.inlineData?.data).length;
-      console.log(
-        `[Live WS] Dropped ${modelTurn.parts.length} content part(s) received with interruption [${ctx.id}]`
-      );
-    } else {
-      if (ctx.currentGenerationId === INITIAL_GENERATION_ID) {
-        nextGeneration(ctx);
-      }
-      const contentGenerationId = ctx.currentGenerationId;
-      frameGenerationId = contentGenerationId;
-      for (const part of modelTurn.parts) {
-        if (part.inlineData?.data) {
-          ctx.modelChunksReceived += 1;
-          // Strict no-audio-playback requirement for Sales Copilot:
-          // Do not forward generated audio payloads to the client.
-          ctx.modelChunksDropped += 1;
-          // Audio still counts as content: it identifies the response the
-          // server is producing even though this build never plays it.
-          ctx.lastContentGenerationId = contentGenerationId;
-        }
-        if (part.text) {
-          ctx.lastContentGenerationId = contentGenerationId;
-          sendToClient(ctx, {
-            type: 'text',
-            sessionId: ctx.id,
-            generationId: contentGenerationId,
-            text: part.text,
-            serverMono: recvMono,
-            serverUtc: recvUtc,
-          });
-        }
-      }
-    }
-  }
-
-  // Stage D: turn complete.
-  //
-  // A trailing `turnComplete` after an interruption closes that interrupted
-  // turn and must not advance the counter a second time. A duplicated
-  // completion for a generation already closed must not advance at all.
-  if (serverContent?.turnComplete) {
-    const completion = resolveTurnCompletion({
-      currentGenerationId: ctx.currentGenerationId,
-      currentHasContent: ctx.lastContentGenerationId === ctx.currentGenerationId,
-      interruptedGenerationId: ctx.interruptedGenerationId,
-      lastContentGenerationId: ctx.lastContentGenerationId,
-      alreadyClosedGenerationIds: [...ctx.closedGenerations],
-    });
-    if (completion.advanceGeneration) nextGeneration(ctx);
-    if (completion.advanceGeneration) ctx.completedTurnsCount += 1;
-    if (completion.advanceGeneration || completion.closesInterruptedTurn) {
-      ctx.closedGenerations.add(completion.completedGenerationId);
-    }
-    ctx.interruptedGenerationId = null;
-
-    console.log(
-      `[Live WS] Turn complete [${ctx.id}] ${completion.completedGenerationId} -> ` +
-        `${ctx.currentGenerationId} (turns=${ctx.completedTurnsCount}, ` +
-        `audioDiscarded=${ctx.modelChunksDropped}` +
-        `${completion.closesInterruptedTurn ? ', closed interrupted turn' : ''}` +
-        `${completion.duplicate ? ', duplicate event' : ''})`
-    );
-    sendToClient(ctx, {
-      type: 'turn_complete',
-      sessionId: ctx.id,
-      completedGenerationId: completion.completedGenerationId,
-      nextGenerationId: ctx.currentGenerationId,
-      completedTurnsCount: ctx.completedTurnsCount,
-      closesInterruptedTurn: completion.closesInterruptedTurn,
-      duplicate: completion.duplicate,
-      audioPacketsDiscarded: ctx.modelChunksDropped,
-      modelPartsDroppedAfterInterrupt: ctx.modelPartsDroppedAfterInterrupt,
       serverMono: recvMono,
       serverUtc: recvUtc,
     });
+
+    ctx.modelChunksReceived += mapped.modelChunksReceived;
+    ctx.modelChunksDropped += mapped.modelChunksDropped;
+    ctx.modelPartsDroppedAfterInterrupt += mapped.contentPartsDroppedAfterInterrupt;
+    ctx.outputTranscriptionsDropped += mapped.outputTranscriptionsDropped;
+
+    for (const frame of mapped.frames) {
+      if (frame.type === 'interrupted') {
+        Object.assign(frame, {
+          bridgeInterruptedRecvMono: recvMono,
+          bridgeInterruptedRecvUtc: recvUtc,
+          bridgeInterruptedSentMono: performance.now(),
+        });
+        console.log(
+          `[Live WS] Interruption [${ctx.id}] ${frame.interruptedGenerationId} -> ` +
+            `${frame.nextGenerationId}${frame.duplicate ? ' (duplicate event)' : ''}`
+        );
+      } else if (frame.type === 'turn_complete') {
+        Object.assign(frame, {
+          audioPacketsDiscarded: ctx.modelChunksDropped,
+          modelPartsDroppedAfterInterrupt: ctx.modelPartsDroppedAfterInterrupt,
+        });
+        console.log(
+          `[Live WS] Turn complete [${ctx.id}] ${frame.completedGenerationId} -> ` +
+            `${frame.nextGenerationId} (turns=${frame.completedTurnsCount}, ` +
+            `audioDiscarded=${ctx.modelChunksDropped}` +
+            `${frame.closesInterruptedTurn ? ', closed interrupted turn' : ''}` +
+            `${frame.duplicate ? ', duplicate event' : ''})`
+        );
+      }
+      sendToClient(ctx, frame);
+    }
   }
 
   // Stage E: token usage metadata (preserved raw from the API)
@@ -573,59 +492,6 @@ function handleServerMessage(
       serverMono: recvMono,
       serverUtc: recvUtc,
     });
-  }
-
-  // Transcripts are forwarded as structured events.
-  // 1. Customer speech: low-latency interim hypothesis while actively speaking
-  const interimInputTranscription = (serverContent as any)?.interimInputTranscription?.text;
-  if (interimInputTranscription) {
-    sendToClient(ctx, {
-      type: 'transcription',
-      sessionId: ctx.id,
-      direction: 'input',
-      isFinal: false,
-      text: interimInputTranscription,
-      serverMono: recvMono,
-      serverUtc: recvUtc,
-    });
-  }
-
-  // 2. Customer speech: finalized utterance segment
-  const inputTranscription = serverContent?.inputTranscription?.text;
-  if (inputTranscription) {
-    sendToClient(ctx, {
-      type: 'transcription',
-      sessionId: ctx.id,
-      direction: 'input',
-      isFinal: true,
-      text: inputTranscription,
-      serverMono: recvMono,
-      serverUtc: recvUtc,
-    });
-  }
-
-  // 3. Private sales copilot suggestions: generated response text from Gemini.
-  //    The generation is captured before `turnComplete` advances the counter;
-  //    otherwise the last words of a suggestion would be tagged as the next
-  //    generation and could be promoted into a ghost recommendation.
-  const outputTranscription = serverContent?.outputTranscription?.text;
-  if (outputTranscription) {
-    if (interruptedInFrame) {
-      // Same stale tail as Stage B: never forward it under a new generation.
-      ctx.modelPartsDroppedAfterInterrupt += 1;
-      console.log(`[Live WS] Dropped output transcript received with interruption [${ctx.id}]`);
-    } else {
-      ctx.lastContentGenerationId = frameGenerationId;
-      sendToClient(ctx, {
-        type: 'transcription',
-        sessionId: ctx.id,
-        direction: 'output',
-        generationId: frameGenerationId,
-        text: outputTranscription,
-        serverMono: recvMono,
-        serverUtc: recvUtc,
-      });
-    }
   }
 
   // Stage F: voice activity signal if the server provides one
@@ -949,15 +815,76 @@ async function handleStart(clientWs: WebSocket, data: any): Promise<void> {
   }
 }
 
+/**
+ * Sends every chunk that was captured before the session became ready, in
+ * capture order. Returns the flush accounting used in logs and in the
+ * `session_ready` frame.
+ */
+function flushPreReadyAudio(ctx: LiveSessionContext): {
+  chunks: number;
+  flushed: number;
+  dropped: number;
+  spanMs: number;
+} {
+  const stats = ctx.preReadyAudio.stats();
+  const chunks = ctx.preReadyAudio.drain(performance.now());
+  let flushed = 0;
+  for (const chunk of chunks) {
+    if (!ctx.gemini || !ctx.active) {
+      ctx.micChunksDropped += 1;
+      continue;
+    }
+    try {
+      ctx.gemini.sendRealtimeInput({
+        audio: { data: chunk.audio, mimeType: 'audio/pcm;rate=16000' },
+      });
+      ctx.micChunksForwarded += 1;
+      ctx.micChunksFlushed += 1;
+      flushed += 1;
+    } catch (err: any) {
+      ctx.micChunksDropped += 1;
+      console.error(
+        `[Live WS] Failed to flush buffered audio [${ctx.id}]:`,
+        err?.message || err
+      );
+    }
+  }
+  return {
+    chunks: chunks.length,
+    flushed,
+    dropped:
+      stats.droppedOnOverflow +
+      stats.droppedOnExpiry +
+      (chunks.length - flushed),
+    spanMs: stats.spanMs,
+  };
+}
+
 function handleAudioFrame(ctx: LiveSessionContext, data: any): void {
   const bridgeRecvMono = performance.now();
   ctx.micChunksReceived += 1;
 
   if (!data.audio || typeof data.audio !== 'string') return;
 
-  // Chunks arriving while the session is (re)connecting are counted and
-  // dropped; they belong to a moment when no model context existed.
   if (!ctx.gemini || !ctx.active) {
+    // Before the *first* setupComplete we retain a bounded window of speech so a
+    // short opening utterance ("Hey") is not truncated. While a ready session is
+    // reconnecting, audio is still dropped: replaying speech from before the
+    // transport gap would feed stale audio into the resumed VAD context.
+    if (!ctx.sawSessionReady && !ctx.reconnecting) {
+      const result = ctx.preReadyAudio.push(
+        {
+          seq: data.seq,
+          audio: data.audio,
+          clientCaptureMono: data.clientCaptureMono,
+          clientSentMono: data.clientSentMono,
+        },
+        bridgeRecvMono
+      );
+      if (result.buffered) ctx.micChunksBuffered += 1;
+      else ctx.micChunksDropped += 1;
+      return;
+    }
     ctx.micChunksDropped += 1;
     return;
   }

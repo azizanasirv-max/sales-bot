@@ -111,6 +111,10 @@ export interface SessionDiagnostics {
 
   // 13-stage pipeline latency metrics
   measuredChunkDurationMs: number;
+  /** Actual AudioContext capture rate reported by the browser. */
+  inputSampleRate: number | null;
+  /** True when capture runs above 16 kHz and must be resampled. */
+  resamplesTo16k: boolean;
   rttTransportLatencyMs: number | null;
   micCaptureToSendMs: number | null;
   bridgeForwardDurationMs: number | null;
@@ -125,6 +129,12 @@ export interface SessionDiagnostics {
   micChunksSent: number;
   micChunksReceivedBridge: number;
   micChunksForwardedBridge: number;
+  /** Chunks the bridge retained while the Live session was being established. */
+  micChunksBufferedBridge: number;
+  /** Chunks flushed in order once the session became ready. */
+  micChunksFlushedBridge: number;
+  /** Capture span (ms) covered by the pre-ready buffer that was flushed. */
+  bufferedAudioSpanMs: number;
   modelChunksReceivedBridge: number;
   modelChunksDeliveredClient: number;
   modelChunksScheduled: number;
@@ -840,6 +850,8 @@ export default function App() {
       endTimeMono: null,
       elapsedSeconds: 0,
       measuredChunkDurationMs: 32, // 512 samples at 16kHz
+      inputSampleRate: null,
+      resamplesTo16k: false,
       rttTransportLatencyMs: null,
       micCaptureToSendMs: null,
       bridgeForwardDurationMs: null,
@@ -852,6 +864,9 @@ export default function App() {
       micChunksSent: 0,
       micChunksReceivedBridge: 0,
       micChunksForwardedBridge: 0,
+      micChunksBufferedBridge: 0,
+      micChunksFlushedBridge: 0,
+      bufferedAudioSpanMs: 0,
       modelChunksReceivedBridge: 0,
       modelChunksDeliveredClient: 0,
       modelChunksScheduled: 0,
@@ -911,6 +926,27 @@ export default function App() {
 
       if (inputCtx.state === 'suspended') await inputCtx.resume();
       inputAudioCtxRef.current = inputCtx;
+      // Report the *measured* capture rate instead of assuming 16 kHz: if the
+      // browser falls back to the hardware rate, the same 512-sample buffer is a
+      // shorter chunk and must be resampled.
+      const measuredChunkDurationMs =
+        Math.round((512 / inputCtx.sampleRate) * 1000 * 100) / 100;
+      setActiveSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              inputSampleRate: inputCtx.sampleRate,
+              resamplesTo16k: inputCtx.sampleRate !== 16000,
+              measuredChunkDurationMs,
+            }
+          : null
+      );
+      logEvent(
+        'pipeline',
+        `Microphone capture: ${inputCtx.sampleRate} Hz, 512-sample chunks ≈ ` +
+          `${measuredChunkDurationMs} ms` +
+          (inputCtx.sampleRate === 16000 ? ' (no resampling)' : ' (resampled to 16 kHz)')
+      );
     } catch (audioCtxErr: any) {
       console.error('[AudioContext Error]:', audioCtxErr);
       logEvent('error', `AudioContext error: ${audioCtxErr.message}`, audioCtxErr);
@@ -985,6 +1021,24 @@ export default function App() {
           }
           if (msg.language?.label) setSessionLanguageLabel(msg.language.label);
           gateRef.current.seedGeneration('gen_0');
+          setActiveSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  micChunksBufferedBridge: msg.bufferedAudioChunksAccepted ?? 0,
+                  micChunksFlushedBridge: msg.bufferedAudioChunksFlushed ?? 0,
+                  bufferedAudioSpanMs: msg.bufferedAudioSpanMs ?? 0,
+                }
+              : null
+          );
+          if (msg.bufferedAudioChunksFlushed) {
+            logEvent(
+              'pipeline',
+              `Flushed ${msg.bufferedAudioChunksFlushed} pre-ready mic chunk(s) ` +
+                `(${msg.bufferedAudioSpanMs ?? 0}ms span, ` +
+                `${msg.bufferedAudioChunksDropped ?? 0} dropped) in capture order`
+            );
+          }
           updateAppState('ready_for_conversation', 'Session setupComplete confirmed');
           setIsMicStreaming(true);
           logEvent(

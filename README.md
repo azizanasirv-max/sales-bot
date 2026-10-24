@@ -27,6 +27,9 @@ Key files:
 | `server.ts` | HTTP/static host, WebSocket bridge, per-session isolation, interruption forwarding, resumption, diagnostics endpoint |
 | `src/App.tsx` | Session UI, microphone capture, playback scheduling, barge-in handling, diagnostics |
 | `src/lib/conversation.ts` | Language policy, `ConversationGate` (generation acceptance), `TurnLedger` (turn lifecycle) — shared and unit-tested |
+| `src/lib/generationLifecycle.ts` | Reconstructed: single bridge generation authority and `mapServerContent` (Gemini frame → client frames) |
+| `src/lib/audioIngest.ts` | Reconstructed: bounded, ordered pre-ready microphone buffer |
+| `src/lib/transcription.ts` | Reconstructed: interim/final input and generation-attributed output transcript classification |
 | `src/lib/liveConfig.ts` | Model resolution, start-request validation, Live session config, error classification |
 | `src/utils/audio.ts` | Resampling, PCM encode/decode, RMS |
 | `tests/unit/*.test.ts` | Offline regression tests for language, interruption, ordering and config |
@@ -43,8 +46,13 @@ Key files:
 3. The bridge validates the model/API key, opens a Gemini Live session with the
    language policy, a sliding context window and session-resumption updates,
    then reports `session_ready` with the **server's** session ID.
-4. Microphone chunks are forwarded with `sendRealtimeInput`; the server drops
-   chunks while no Live context is active (connecting/reconnecting).
+4. Microphone chunks are forwarded with `sendRealtimeInput`. Until the first
+   `setupComplete` the bridge keeps a bounded FIFO window (250 chunks / 512 KB /
+   15 s) and flushes it in capture order once the session is ready, so a short
+   opening utterance is not truncated. Audio captured during a reconnect is still
+   dropped rather than replayed. `session_ready` reports how many chunks were
+   flushed and the capture span, and the client records the measured input
+   sample rate and chunk duration.
 5. Model audio is tagged with a **generation ID**. This build never forwards
    generated audio to the browser (text-only suggestions); the `ConversationGate`
    still owns generation validity so late/stale content cannot be attributed to
@@ -133,7 +141,14 @@ credentials.
   remains a known limitation and is being investigated separately in Google AI
   Studio. No artificial delay or "perfect attribution" claim is made here.
 * Microphone audio captured while the Gemini session is reconnecting is dropped,
-  not buffered, to avoid feeding stale speech into the resumed VAD context.
+  not buffered, to avoid feeding stale speech into the resumed VAD context. The
+  pre-ready buffer only covers the first connection and is bounded (dropping the
+  oldest audio beyond its limits).
+* **Provenance of `src/lib/audioIngest.ts`, `src/lib/generationLifecycle.ts` and
+  `src/lib/transcription.ts`.** The original Stage 3 branch and files were not
+  present in any Git reference, reflog, dangling object, Cline artifact or other
+  workspace. These modules are a documented reconstruction of the missing
+  behaviour on top of the verified bridge; they are not the original files.
 * `ScriptProcessorNode` is deprecated but retained to avoid changing the capture
   architecture; it is supported by all current browsers.
 * The resumption path depends on the Live API issuing `sessionResumptionUpdate`
