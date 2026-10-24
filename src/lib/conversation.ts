@@ -144,6 +144,128 @@ export function generationOrdinal(generationId: string | null | undefined): numb
 }
 
 
+/* ------------------------------------------------------------------------- */
+/* Transport-epoch, interruption and turn-completion policy                   */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * A callback belongs to a superseded transport when its epoch is not the
+ * context's current epoch. A delayed `onmessage`/`onclose` from a socket that
+ * has already been replaced (resume or restart) must not mutate the session.
+ */
+export function isStaleTransportEpoch(currentEpoch: number, eventEpoch: number): boolean {
+  return eventEpoch !== currentEpoch;
+}
+
+/**
+ * The Live API documents an interruption as `interrupted` followed by
+ * `turnComplete` for the *same* turn. The bridge used to advance its generation
+ * counter on both events, so one barge-in consumed two generation IDs: one for
+ * the interrupted turn and one empty "reserved" slot. When `turnComplete` had
+ * already advanced the counter while the previous response was still being
+ * produced, a later interruption was attributed to the empty slot and the
+ * generation that actually produced content was never retired.
+ */
+export interface InterruptionAttributionInput {
+  currentGenerationId: string;
+  /** Generation that last delivered audio or text, if any. */
+  lastContentGenerationId: string | null;
+  /** Generations already interrupted in this session. */
+  alreadyInterrupted: readonly string[];
+}
+
+export interface InterruptionAttribution {
+  interruptedGenerationId: string;
+  /** Whether a new generation slot must be reserved for the next response. */
+  advanceGeneration: boolean;
+  /** True when this event repeats an interruption already handled. */
+  duplicate: boolean;
+  firstObservation: boolean;
+}
+
+export function resolveInterruptionAttribution(
+  input: InterruptionAttributionInput
+): InterruptionAttribution {
+  const contentGenerationId = input.lastContentGenerationId;
+  // The current slot only owns the interruption when it actually produced
+  // content. Otherwise it is the reserved slot for the *next* response.
+  const attributedToCurrent =
+    contentGenerationId === null || contentGenerationId === input.currentGenerationId;
+  const interruptedGenerationId = attributedToCurrent
+    ? input.currentGenerationId
+    : (contentGenerationId as string);
+
+  const duplicate = input.alreadyInterrupted.includes(interruptedGenerationId);
+  return {
+    interruptedGenerationId,
+    // A duplicate event must not consume another generation slot.
+    advanceGeneration: attributedToCurrent && !duplicate,
+    duplicate,
+    firstObservation: !duplicate,
+  };
+}
+
+export interface TurnCompletionInput {
+  currentGenerationId: string;
+  /** Whether the current slot already delivered audio/text. */
+  currentHasContent: boolean;
+  /** Generation invalidated by the interruption that this completion closes. */
+  interruptedGenerationId: string | null;
+  /** Generation that last delivered audio/text, if any. */
+  lastContentGenerationId?: string | null;
+  /** Generations whose terminal event has already been applied. */
+  alreadyClosedGenerationIds?: readonly string[];
+}
+
+export interface TurnCompletion {
+  completedGenerationId: string;
+  /** Whether a new generation slot must be reserved for the next response. */
+  advanceGeneration: boolean;
+  closesInterruptedTurn: boolean;
+  /** True when this completion repeats one already applied. */
+  duplicate: boolean;
+}
+
+/**
+ * Decides which generation a `turnComplete` closes.
+ *
+ * After an interruption the API sends `turnComplete` for the interrupted turn,
+ * after the bridge has already reserved the next slot. That completion must
+ * name the interrupted generation and must not advance the counter again.
+ */
+export function resolveTurnCompletion(input: TurnCompletionInput): TurnCompletion {
+  const alreadyClosed = input.alreadyClosedGenerationIds ?? [];
+
+  if (input.interruptedGenerationId && !input.currentHasContent) {
+    return {
+      completedGenerationId: input.interruptedGenerationId,
+      advanceGeneration: false,
+      closesInterruptedTurn: true,
+      duplicate: alreadyClosed.includes(input.interruptedGenerationId),
+    };
+  }
+
+  if (!input.currentHasContent) {
+    // The current slot was reserved by an earlier completion and produced
+    // nothing of its own: this is a late/duplicate completion, not a new turn.
+    // Never burn another generation ID for it.
+    const completedGenerationId = input.lastContentGenerationId ?? input.currentGenerationId;
+    return {
+      completedGenerationId,
+      advanceGeneration: false,
+      closesInterruptedTurn: false,
+      duplicate: alreadyClosed.includes(completedGenerationId),
+    };
+  }
+
+  return {
+    completedGenerationId: input.currentGenerationId,
+    advanceGeneration: !alreadyClosed.includes(input.currentGenerationId),
+    closesInterruptedTurn: false,
+    duplicate: alreadyClosed.includes(input.currentGenerationId),
+  };
+}
+
 export type AudioRejectionReason = 'invalidated' | 'stale';
 
 export interface AudioAcceptance {
@@ -335,6 +457,14 @@ export class ConversationGate {
   /**
    * Server-reported interruption. Invalidates exactly the generation the
    * server reported and adopts the server's next generation ID.
+   *
+   * A generation that is still scheduled for playback but is *older* than the
+   * interrupted one can only be the tail of an obsolete response: the answer to
+   * the interrupting utterance cannot reuse an earlier generation ID. Those
+   * tails must be stopped too, otherwise a barge-in whose interruption event is
+   * attributed to the server's newest (empty) slot leaves the audible tail of
+   * the previous turn playing. Newer generations are never touched: they may be
+   * the answer that already arrived out of order.
    */
   handleInterruption(
     interruptedGenerationId?: string | null,
@@ -346,6 +476,16 @@ export class ConversationGate {
       const alreadyKnown = this.invalidatedGenerations.has(interruptedGenerationId);
       if (this.addInvalidated(interruptedGenerationId)) invalidated.push(interruptedGenerationId);
       firstObservation = !alreadyKnown;
+
+      const interruptedOrdinal = generationOrdinal(interruptedGenerationId);
+      if (interruptedOrdinal !== null) {
+        for (const generationId of [...this.playingGenerations]) {
+          const ordinal = generationOrdinal(generationId);
+          if (ordinal !== null && ordinal < interruptedOrdinal) {
+            if (this.addInvalidated(generationId)) invalidated.push(generationId);
+          }
+        }
+      }
     }
     this.noteNextGeneration(nextGenerationId);
     return { invalidated, firstObservation, nextGenerationId: this.activeGenerationId };
@@ -674,6 +814,21 @@ export interface SalesSuggestionEntry {
 }
 
 /**
+ * Result of appending one output-transcript delta.
+ *
+ * `unattributed` means the bridge delivered text without a generation ID. Such
+ * text is never guessed into the newest generation: it is dropped, because a
+ * late transcript belongs to whichever response produced it, not to whatever
+ * generation happens to be active now.
+ */
+export interface SuggestionDeltaResult {
+  entry: SalesSuggestionEntry | null;
+  created: boolean;
+  isStale: boolean;
+  unattributed: boolean;
+}
+
+/**
  * Ordered, bounded ledger for private sales copilot suggestions generated by Gemini.
  * Keyed by generationId. Accumulates incremental delta text, tracks turn completion/interruption,
  * and isolates stale generations so older responses cannot overwrite newer suggestions.
@@ -684,6 +839,13 @@ export class SalesSuggestionLedger {
   private activeGenerationId: string = INITIAL_GENERATION_ID;
   private counter = 0;
   private readonly maxEntries: number;
+  /**
+   * Generations whose entry has been completed, interrupted or evicted from the
+   * bounded history. A late delta for one of these must never recreate a
+   * historical suggestion (which would make it the "latest" record again).
+   */
+  private closedGenerations = new Set<string>();
+  private static readonly MAX_CLOSED_GENERATIONS = 200;
 
   constructor(maxEntries = 50, private readonly nowUtc: () => string = () => new Date().toISOString()) {
     this.maxEntries = maxEntries;
@@ -692,8 +854,21 @@ export class SalesSuggestionLedger {
   clear(): void {
     this.suggestions = [];
     this.byGeneration.clear();
+    this.closedGenerations.clear();
     this.activeGenerationId = INITIAL_GENERATION_ID;
     this.counter = 0;
+  }
+
+  /**
+   * Records that a generation can no longer accept text. The set is bounded so
+   * a long session cannot grow without limit.
+   */
+  private rememberClosed(generationId: string): void {
+    this.closedGenerations.add(generationId);
+    if (this.closedGenerations.size > SalesSuggestionLedger.MAX_CLOSED_GENERATIONS) {
+      const oldest = this.closedGenerations.values().next().value;
+      if (oldest !== undefined) this.closedGenerations.delete(oldest);
+    }
   }
 
   getActiveGenerationId(): string {
@@ -708,19 +883,34 @@ export class SalesSuggestionLedger {
     generationId: string | undefined,
     deltaText: string,
     options: { latencyMs?: number; monoTime?: number } = {}
-  ): { entry: SalesSuggestionEntry | null; created: boolean; isStale: boolean } {
-    if (!deltaText) return { entry: null, created: false, isStale: false };
-    const gen = generationId || this.activeGenerationId || INITIAL_GENERATION_ID;
+  ): SuggestionDeltaResult {
+    if (!generationId) {
+      // Never attribute unattributed text to the newest generation.
+      return { entry: null, created: false, isStale: false, unattributed: true };
+    }
+    if (!deltaText) {
+      return { entry: null, created: false, isStale: false, unattributed: false };
+    }
+    const gen = generationId;
 
     // Reject out-of-order stale chunks from older generations
     const genOrdinal = generationOrdinal(gen);
     const activeOrdinal = generationOrdinal(this.activeGenerationId);
     if (genOrdinal !== null && activeOrdinal !== null && genOrdinal < activeOrdinal) {
-      return { entry: null, created: false, isStale: true };
+      return { entry: null, created: false, isStale: true, unattributed: false };
     }
 
     let entry = this.byGeneration.get(gen);
     if (!entry) {
+      if (this.closedGenerations.has(gen)) {
+        // A terminal (or evicted) generation cannot be recreated by late text:
+        // resurrecting it would make a historical suggestion the newest record.
+        return { entry: null, created: false, isStale: true, unattributed: false };
+      }
+      if (!deltaText.trim()) {
+        // Punctuation/spacing-only parts must not create an empty suggestion.
+        return { entry: null, created: false, isStale: false, unattributed: false };
+      }
       this.counter += 1;
       this.activeGenerationId = gen;
       entry = {
@@ -738,21 +928,46 @@ export class SalesSuggestionLedger {
       this.suggestions.unshift(entry);
       if (this.suggestions.length > this.maxEntries) {
         const removed = this.suggestions.pop();
-        if (removed) this.byGeneration.delete(removed.generationId);
+        if (removed) {
+          this.byGeneration.delete(removed.generationId);
+          this.rememberClosed(removed.generationId);
+        }
       }
-      return { entry: { ...entry }, created: true, isStale: false };
+      return { entry: { ...entry }, created: true, isStale: false, unattributed: false };
     }
 
     if (entry.status !== 'streaming') {
       // Completed or interrupted generation cannot absorb late text
-      return { entry: { ...entry }, created: false, isStale: true };
+      return { entry: { ...entry }, created: false, isStale: true, unattributed: false };
     }
 
     entry.text += deltaText;
     if (entry.latencyMs === undefined && options.latencyMs !== undefined) {
       entry.latencyMs = options.latencyMs;
     }
-    return { entry: { ...entry }, created: false, isStale: false };
+    return { entry: { ...entry }, created: false, isStale: false, unattributed: false };
+  }
+
+  /**
+   * Demotes recommendations that are still "streaming" for a generation older
+   * than `activeGenerationId`. A new customer utterance makes such a
+   * recommendation obsolete; leaving it streaming would keep a stale
+   * recommendation looking active in the UI.
+   */
+  retireStreamingBefore(activeGenerationId?: string | null): SalesSuggestionEntry[] {
+    const activeOrdinal = generationOrdinal(activeGenerationId);
+    if (activeOrdinal === null) return [];
+    const retired: SalesSuggestionEntry[] = [];
+    for (const entry of this.suggestions) {
+      if (entry.status !== 'streaming') continue;
+      const ordinal = generationOrdinal(entry.generationId);
+      if (ordinal === null || ordinal >= activeOrdinal) continue;
+      entry.status = 'interrupted';
+      entry.completedAtUtc = this.nowUtc();
+      this.rememberClosed(entry.generationId);
+      retired.push({ ...entry });
+    }
+    return retired;
   }
 
   completeTurn(generationId?: string | null): SalesSuggestionEntry | null {
@@ -761,18 +976,25 @@ export class SalesSuggestionLedger {
     if (!entry || entry.status !== 'streaming') return null;
     entry.status = 'completed';
     entry.completedAtUtc = this.nowUtc();
+    this.rememberClosed(generationId);
     return { ...entry };
   }
 
   interruptTurn(generationId?: string | null, nextGenId?: string | null): SalesSuggestionEntry | null {
     if (nextGenId) {
-      this.activeGenerationId = nextGenId;
+      const nextOrdinal = generationOrdinal(nextGenId);
+      const activeOrdinal = generationOrdinal(this.activeGenerationId);
+      // Never move the active generation backwards on a late event.
+      if (nextOrdinal === null || activeOrdinal === null || nextOrdinal >= activeOrdinal) {
+        this.activeGenerationId = nextGenId;
+      }
     }
     if (!generationId) return null;
     const entry = this.byGeneration.get(generationId);
     if (!entry || entry.status !== 'streaming') return null;
     entry.status = 'interrupted';
     entry.completedAtUtc = this.nowUtc();
+    this.rememberClosed(generationId);
     return { ...entry };
   }
 

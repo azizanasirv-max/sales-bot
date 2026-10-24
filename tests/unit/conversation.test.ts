@@ -7,8 +7,11 @@ import {
   SalesSuggestionLedger,
   buildLanguageInstruction,
   composeSystemInstruction,
+  isStaleTransportEpoch,
+  resolveInterruptionAttribution,
   resolveLanguagePreference,
   resolvePlaybackStopSet,
+  resolveTurnCompletion,
   shouldTriggerLocalBargeIn,
 } from '../../src/lib/conversation';
 
@@ -416,4 +419,299 @@ test('sales suggestion ledger: bounds entries to maxEntries and clears cleanly',
   assert.equal(ledger.getLatest(), null);
 });
 
+
+
+/* ------------------------------------------------------------------------- */
+/* Stage 4: interruption lifecycle (production mapping)                       */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Minimal in-test driver for the bridge's generation state machine. It applies
+ * the *production* decision functions (`resolveInterruptionAttribution` and
+ * `resolveTurnCompletion`) exactly as `server.ts` does, so the sequences below
+ * are the same ones a live session produces.
+ */
+class BridgeLifecycle {
+  currentGenerationId = 'gen_0';
+  lastContentGenerationId: string | null = null;
+  interruptedGenerationId: string | null = null;
+  readonly interrupted = new Set<string>();
+  readonly closed = new Set<string>();
+  private counter = 0;
+
+  private nextGeneration(): void {
+    this.counter += 1;
+    this.currentGenerationId = `gen_${this.counter}`;
+  }
+
+  content(): string {
+    if (this.currentGenerationId === 'gen_0') this.nextGeneration();
+    this.lastContentGenerationId = this.currentGenerationId;
+    return this.currentGenerationId;
+  }
+
+  interrupt(): { generationId: string; duplicate: boolean; advance: boolean } {
+    const attribution = resolveInterruptionAttribution({
+      currentGenerationId: this.currentGenerationId,
+      lastContentGenerationId: this.lastContentGenerationId,
+      alreadyInterrupted: [...this.interrupted],
+    });
+    if (!attribution.duplicate) {
+      this.interrupted.add(attribution.interruptedGenerationId);
+      this.interruptedGenerationId = attribution.interruptedGenerationId;
+    }
+    if (attribution.advanceGeneration) this.nextGeneration();
+    return {
+      generationId: attribution.interruptedGenerationId,
+      duplicate: attribution.duplicate,
+      advance: attribution.advanceGeneration,
+    };
+  }
+
+  complete(): ReturnType<typeof resolveTurnCompletion> {
+    const completion = resolveTurnCompletion({
+      currentGenerationId: this.currentGenerationId,
+      currentHasContent: this.lastContentGenerationId === this.currentGenerationId,
+      interruptedGenerationId: this.interruptedGenerationId,
+      lastContentGenerationId: this.lastContentGenerationId,
+      alreadyClosedGenerationIds: [...this.closed],
+    });
+    if (completion.advanceGeneration) this.nextGeneration();
+    if (completion.advanceGeneration || completion.closesInterruptedTurn) {
+      this.closed.add(completion.completedGenerationId);
+    }
+    this.interruptedGenerationId = null;
+    return completion;
+  }
+}
+
+test('lifecycle: normal uninterrupted completion advances exactly once', () => {
+  const bridge = new BridgeLifecycle();
+  const gen = bridge.content();
+  assert.equal(gen, 'gen_1');
+
+  const completion = bridge.complete();
+  assert.equal(completion.completedGenerationId, 'gen_1');
+  assert.equal(completion.closesInterruptedTurn, false);
+  assert.equal(completion.advanceGeneration, true);
+  assert.equal(completion.duplicate, false);
+  assert.equal(bridge.currentGenerationId, 'gen_2');
+});
+
+test('lifecycle: a duplicate completion event cannot advance a generation twice', () => {
+  const bridge = new BridgeLifecycle();
+  bridge.content();
+  bridge.complete();
+  assert.equal(bridge.currentGenerationId, 'gen_2');
+
+  const duplicate = bridge.complete();
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.advanceGeneration, false);
+  assert.equal(duplicate.completedGenerationId, 'gen_1');
+  assert.equal(bridge.currentGenerationId, 'gen_2');
+});
+
+test('lifecycle: interruption followed by completion closes the interrupted generation once', () => {
+  const bridge = new BridgeLifecycle();
+  const gen = bridge.content();
+
+  const interruption = bridge.interrupt();
+  assert.equal(interruption.generationId, gen);
+  assert.equal(interruption.duplicate, false);
+  assert.equal(bridge.currentGenerationId, 'gen_2');
+
+  const completion = bridge.complete();
+  assert.equal(completion.completedGenerationId, gen);
+  assert.equal(completion.closesInterruptedTurn, true);
+  assert.equal(completion.advanceGeneration, false);
+  // One barge-in must consume exactly one generation ID.
+  assert.equal(bridge.currentGenerationId, 'gen_2');
+
+  // The answer to the barge-in reuses the reserved slot.
+  assert.equal(bridge.content(), 'gen_2');
+});
+
+test('lifecycle: repeated interruption events are idempotent', () => {
+  const bridge = new BridgeLifecycle();
+  bridge.content();
+  assert.equal(bridge.interrupt().generationId, 'gen_1');
+  assert.equal(bridge.currentGenerationId, 'gen_2');
+
+  const duplicate = bridge.interrupt();
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.advance, false);
+  assert.equal(duplicate.generationId, 'gen_1');
+  assert.equal(bridge.currentGenerationId, 'gen_2');
+});
+
+test('lifecycle: interruption after turn_complete is attributed to the generation that produced content', () => {
+  const bridge = new BridgeLifecycle();
+  bridge.content(); // gen_1 produced content
+  bridge.complete(); // reserve gen_2 while gen_1 may still be audible
+  assert.equal(bridge.currentGenerationId, 'gen_2');
+
+  // The barge-in must retire gen_1 (the audible response), not the empty slot.
+  const interruption = bridge.interrupt();
+  assert.equal(interruption.generationId, 'gen_1');
+  assert.equal(interruption.advance, false);
+  assert.equal(bridge.currentGenerationId, 'gen_2');
+});
+
+
+test('lifecycle: a late output transcript cannot be attributed to the newest generation', () => {
+  const bridge = new BridgeLifecycle();
+  bridge.content(); // gen_1 streaming
+  bridge.interrupt();
+  bridge.complete(); // gen_1 interrupted and closed
+  const answerGen = bridge.content(); // gen_2
+  assert.equal(answerGen, 'gen_2');
+
+  // A delayed transcript tagged with the terminal generation is stale, and an
+  // untagged one is unattributed - neither may become a gen_2 suggestion.
+  const ledger = new SalesSuggestionLedger(10);
+  ledger.appendDelta(answerGen, 'Active suggestion');
+  const late = ledger.appendDelta('gen_1', 'obsolescent tail');
+  assert.equal(late.isStale, true);
+  const untagged = ledger.appendDelta(undefined, 'obsolescent tail');
+  assert.equal(untagged.unattributed, true);
+  assert.equal(untagged.entry, null);
+
+  assert.equal(ledger.getAll().length, 1);
+  assert.equal(ledger.getLatest()?.generationId, 'gen_2');
+  assert.equal(ledger.get('gen_1'), null);
+});
+
+test('lifecycle: an interrupted generation can never become completed', () => {
+  const suggestions = new SalesSuggestionLedger(10);
+  suggestions.appendDelta('gen_1', 'Offer the annual plan');
+  assert.ok(suggestions.interruptTurn('gen_1', 'gen_2'));
+  // The trailing turn_complete names gen_1; completing it must be a no-op.
+  assert.equal(suggestions.completeTurn('gen_1'), null);
+  assert.equal(suggestions.get('gen_1')?.status, 'interrupted');
+
+  const turns = new TurnLedger();
+  turns.appendText('gen_1', 'Offer the annual plan');
+  assert.equal(turns.interrupt('gen_1'), true);
+  assert.equal(turns.complete('gen_1'), false);
+  assert.equal(turns.get('gen_1')?.status, 'interrupted');
+});
+
+test('lifecycle: invalid lifecycle transitions are rejected without mutating the record', () => {
+  const suggestions = new SalesSuggestionLedger(10);
+  suggestions.appendDelta('gen_1', 'Offer the annual plan');
+  assert.ok(suggestions.completeTurn('gen_1'));
+  assert.equal(suggestions.interruptTurn('gen_1', 'gen_2'), null);
+  assert.equal(suggestions.get('gen_1')?.status, 'completed');
+  // Late text cannot reopen a completed generation.
+  const late = suggestions.appendDelta('gen_1', ' ...and onboarding');
+  assert.equal(late.isStale, true);
+  assert.equal(suggestions.get('gen_1')?.text, 'Offer the annual plan');
+
+  const turns = new TurnLedger();
+  turns.appendText('gen_1', 'Offer the annual plan');
+  assert.equal(turns.complete('gen_1'), true);
+  assert.equal(turns.interrupt('gen_1'), false);
+  assert.equal(turns.get('gen_1')?.status, 'completed');
+});
+
+test('lifecycle: a new customer utterance retires an obsolete streaming suggestion', () => {
+  const ledger = new SalesSuggestionLedger(10);
+  ledger.appendDelta('gen_1', 'Obsolete recommendation');
+  ledger.appendDelta('gen_2', 'Current recommendation');
+  assert.equal(ledger.get('gen_1')?.status, 'streaming');
+
+  const retired = ledger.retireStreamingBefore('gen_2');
+  assert.deepEqual(
+    retired.map((entry) => entry.generationId),
+    ['gen_1']
+  );
+  assert.equal(ledger.get('gen_1')?.status, 'interrupted');
+  // The recommendation that belongs to the current generation is untouched.
+  assert.equal(ledger.get('gen_2')?.status, 'streaming');
+  assert.equal(ledger.getLatest()?.generationId, 'gen_2');
+
+  // Missing attribution cannot demote anything.
+  assert.deepEqual(ledger.retireStreamingBefore(null), []);
+});
+
+
+test('lifecycle: empty/audio-only parts cannot create an empty suggestion record', () => {
+  const ledger = new SalesSuggestionLedger(10);
+  assert.equal(ledger.appendDelta('gen_1', '').created, false);
+  assert.equal(ledger.appendDelta('gen_1', '   ').created, false);
+  assert.equal(ledger.appendDelta('gen_1', '\n').created, false);
+  assert.equal(ledger.size(), 0);
+  assert.equal(ledger.getLatest(), null);
+
+  // Whitespace appended to a real suggestion is still preserved verbatim.
+  ledger.appendDelta('gen_1', 'Ask about');
+  const spaced = ledger.appendDelta('gen_1', ' budget ');
+  assert.equal(spaced.created, false);
+  assert.equal(ledger.get('gen_1')?.text, 'Ask about budget ');
+});
+
+test('lifecycle: a terminal generation cannot be resurrected after eviction', () => {
+  const ledger = new SalesSuggestionLedger(2);
+  ledger.appendDelta('gen_1', 'First');
+  ledger.appendDelta('gen_2', 'Second');
+  ledger.appendDelta('gen_3', 'Third'); // evicts gen_1
+
+  assert.equal(ledger.size(), 2);
+  const late = ledger.appendDelta('gen_1', ' late tail');
+  assert.equal(late.isStale, true);
+  assert.equal(late.created, false);
+  assert.equal(ledger.size(), 2);
+  assert.equal(ledger.getLatest()?.generationId, 'gen_3');
+  // No duplicate historical record was created.
+  assert.equal(
+    ledger.getAll().filter((entry) => entry.generationId === 'gen_1').length,
+    0
+  );
+});
+
+test('lifecycle: a late delta for an older live record never becomes the latest', () => {
+  const ledger = new SalesSuggestionLedger(10);
+  ledger.appendDelta('gen_1', 'First suggestion');
+  ledger.appendDelta('gen_2', 'Second suggestion');
+
+  // gen_1 is older than the active generation: late text is stale, not merged.
+  const late = ledger.appendDelta('gen_1', ' extra');
+  assert.equal(late.isStale, true);
+  assert.equal(ledger.getLatest()?.generationId, 'gen_2');
+  assert.equal(ledger.get('gen_1')?.text, 'First suggestion');
+  assert.deepEqual(
+    ledger.getAll().map((entry) => entry.generationId),
+    ['gen_2', 'gen_1']
+  );
+});
+
+test('lifecycle: missing generation ids are never completed or interrupted', () => {
+  const ledger = new SalesSuggestionLedger(10);
+  ledger.appendDelta('gen_1', 'Suggestion');
+  assert.equal(ledger.completeTurn(undefined), null);
+  assert.equal(ledger.completeTurn(null), null);
+  assert.equal(ledger.interruptTurn(undefined, undefined), null);
+  assert.equal(ledger.interruptTurn(null, null), null);
+  assert.equal(ledger.get('gen_1')?.status, 'streaming');
+  assert.deepEqual(ledger.retireStreamingBefore(undefined), []);
+});
+
+test('lifecycle: events from a superseded transport epoch are rejected', () => {
+  assert.equal(isStaleTransportEpoch(3, 2), true);
+  assert.equal(isStaleTransportEpoch(3, 4), true);
+  assert.equal(isStaleTransportEpoch(3, 3), false);
+});
+
+test('gate: an interruption attributed to a reserved slot still stops the older playing tail', () => {
+  const gate = new ConversationGate();
+  gate.acceptAudio('gen_1');
+  gate.markPlaybackScheduled('gen_1');
+  gate.handleTurnComplete('gen_1', 'gen_2'); // gen_2 reserved, no content
+
+  const interruption = gate.handleInterruption('gen_1', 'gen_2');
+  assert.deepEqual(interruption.invalidated, ['gen_1']);
+  assert.equal(gate.isInvalidated('gen_1'), true);
+  assert.equal(gate.isInvalidated('gen_2'), false);
+  assert.equal(gate.acceptAudio('gen_2').accepted, true);
+});
 

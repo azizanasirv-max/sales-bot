@@ -45,14 +45,18 @@ Key files:
    then reports `session_ready` with the **server's** session ID.
 4. Microphone chunks are forwarded with `sendRealtimeInput`; the server drops
    chunks while no Live context is active (connecting/reconnecting).
-5. Model audio is tagged with a **generation ID**. The client's
-   `ConversationGate` decides whether each chunk may be decoded and scheduled.
-6. `turn_complete` advances the server generation and closes exactly the turn it
-   names in the client `TurnLedger`.
-7. Barge-in: local VAD stops playback immediately and invalidates only the
-   generations that are playing or still streaming. The server's `interrupted`
-   event invalidates the reported generation and advances to the next one, whose
-   audio is accepted normally.
+5. Model audio is tagged with a **generation ID**. This build never forwards
+   generated audio to the browser (text-only suggestions); the `ConversationGate`
+   still owns generation validity so late/stale content cannot be attributed to
+   the current turn.
+6. `turn_complete` closes exactly the turn it names in the client `TurnLedger`.
+   A trailing `turnComplete` after an interruption closes the *interrupted*
+   generation and does not advance the counter a second time.
+7. Barge-in: the server's `interrupted` event is attributed to the generation
+   that last produced content (not to an empty reserved slot), is idempotent for
+   duplicate events, and invalidates only that generation. Local VAD remains the
+   immediate-stop path; content coalesced with an interruption is discarded as a
+   stale tail rather than promoted into the next turn.
 8. On transport loss after a ready session the bridge resumes the Live session
    with its resumption handle (max 2 attempts). The client keeps its audio graph,
    history and language; if resumption is impossible the session fails closed
@@ -121,6 +125,13 @@ credentials.
 * If the bridge WebSocket itself drops (not the Gemini transport), the Gemini
   session is unreachable and the conversation cannot be resumed without replaying
   history. The UI fails closed and requires a new session.
+* **Deferred — late-transcription attribution.** A delayed output transcript
+  whose generation ID is absent cannot be proven to belong to any particular
+  turn. The client drops such text instead of guessing, and text for a terminal
+  generation is rejected. This does not fully solve the protocol-level case where
+  the *provider* delivers a late transcript tagged with a subsequent turn; that
+  remains a known limitation and is being investigated separately in Google AI
+  Studio. No artificial delay or "perfect attribution" claim is made here.
 * Microphone audio captured while the Gemini session is reconnecting is dropped,
   not buffered, to avoid feeding stale speech into the resumed VAD context.
 * `ScriptProcessorNode` is deprecated but retained to avoid changing the capture

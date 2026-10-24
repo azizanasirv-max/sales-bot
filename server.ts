@@ -7,7 +7,10 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI, type LiveServerMessage, type Session } from '@google/genai';
 import {
   INITIAL_GENERATION_ID,
+  isStaleTransportEpoch,
+  resolveInterruptionAttribution,
   resolveLanguagePreference,
+  resolveTurnCompletion,
   type LanguagePreference,
 } from './src/lib/conversation';
 import {
@@ -173,6 +176,19 @@ interface LiveSessionContext {
   currentGenerationId: string;
   chunkSeqInGeneration: number;
   interruptedGenerations: Set<string>;
+  /**
+   * Generation that last delivered content (audio or text). The Live API's
+   * `interrupted` flag refers to the response being produced, which is not
+   * always `currentGenerationId`: after `turnComplete` the bridge has already
+   * reserved the next (content-less) slot.
+   */
+  lastContentGenerationId: string | null;
+  /** Interrupted generation whose trailing `turnComplete` is still expected. */
+  interruptedGenerationId: string | null;
+  /** Generations whose terminal event has already been applied. */
+  closedGenerations: Set<string>;
+  /** Content parts dropped because they arrived with an interruption flag. */
+  modelPartsDroppedAfterInterrupt: number;
 
   micChunksReceived: number;
   micChunksForwarded: number;
@@ -233,6 +249,10 @@ function createSessionContext(
     currentGenerationId: INITIAL_GENERATION_ID,
     chunkSeqInGeneration: 0,
     interruptedGenerations: new Set<string>(),
+    lastContentGenerationId: null,
+    interruptedGenerationId: null,
+    closedGenerations: new Set<string>(),
+    modelPartsDroppedAfterInterrupt: 0,
     micChunksReceived: 0,
     micChunksForwarded: 0,
     micChunksDropped: 0,
@@ -266,7 +286,7 @@ function sendToClient(ctx: LiveSessionContext, payload: Record<string, unknown>)
  * currently owns the socket *and* to the transport that is currently open.
  */
 function isCurrentConnection(ctx: LiveSessionContext, epoch: number): boolean {
-  return isCurrent(ctx) && ctx.connectionEpoch === epoch;
+  return isCurrent(ctx) && !isStaleTransportEpoch(ctx.connectionEpoch, epoch);
 }
 
 function nextGeneration(ctx: LiveSessionContext): string {
@@ -402,24 +422,41 @@ function handleServerMessage(
     }
   }
 
-  // Stage C: interruption must be handled before any content in this frame.
-  if (serverContent?.interrupted) {
-    const interruptedGen = ctx.currentGenerationId;
-    const firstObservation = !ctx.interruptedGenerations.has(interruptedGen);
-    if (firstObservation) {
+  // Stage C: interruption attribution.
+  //
+  // The API reports `interrupted` for the turn that was being produced, then
+  // closes that turn with `turnComplete`. `ctx.currentGenerationId` may already
+  // be a reserved, content-less slot because an earlier `turnComplete` advanced
+  // it. Attribute the interruption to the generation that actually produced
+  // content, reserve at most one new slot, and treat repeats as duplicates.
+  const interruptedInFrame = Boolean(serverContent?.interrupted);
+  if (interruptedInFrame) {
+    const attribution = resolveInterruptionAttribution({
+      currentGenerationId: ctx.currentGenerationId,
+      lastContentGenerationId: ctx.lastContentGenerationId,
+      alreadyInterrupted: [...ctx.interruptedGenerations],
+    });
+    const interruptedGen = attribution.interruptedGenerationId;
+
+    if (!attribution.duplicate) {
       ctx.interruptedGenerations.add(interruptedGen);
       ctx.serverInterruptionEventsCount += 1;
+      ctx.interruptedGenerationId = interruptedGen;
     }
-    nextGeneration(ctx);
+    // Reserve the next slot once per interrupted turn. A duplicate event must
+    // not consume another generation ID.
+    if (attribution.advanceGeneration) nextGeneration(ctx);
+
     console.log(
       `[Live WS] Interruption [${ctx.id}] ${interruptedGen} -> ${ctx.currentGenerationId}` +
-        `${firstObservation ? '' : ' (duplicate event)'}`
+        `${attribution.duplicate ? ' (duplicate event)' : ''}`
     );
     sendToClient(ctx, {
       type: 'interrupted',
       sessionId: ctx.id,
       interruptedGenerationId: interruptedGen,
       nextGenerationId: ctx.currentGenerationId,
+      duplicate: attribution.duplicate,
       serverInterruptionCount: ctx.serverInterruptionEventsCount,
       bridgeInterruptedRecvMono: recvMono,
       bridgeInterruptedRecvUtc: recvUtc,
@@ -427,50 +464,91 @@ function handleServerMessage(
     });
   }
 
+  // Generation that owns any content in this frame. `turnComplete` advances
+  // `currentGenerationId` later in the same message, so it must be captured now.
+  let frameGenerationId = ctx.currentGenerationId;
+
   // Stage B: model turn content (24kHz PCM chunks & text transcript)
   const modelTurn = serverContent?.modelTurn;
   if (modelTurn?.parts?.length) {
-    if (ctx.currentGenerationId === INITIAL_GENERATION_ID) {
-      nextGeneration(ctx);
-    }
-    for (const part of modelTurn.parts) {
-      if (part.inlineData?.data) {
-        ctx.modelChunksReceived += 1;
-        // Strict no-audio-playback requirement for Sales Copilot:
-        // Do not forward generated audio payloads to the client.
-        // We filter out generated audio packets before browser delivery.
-        ctx.modelChunksDropped += 1;
+    if (interruptedInFrame) {
+      // Content coalesced with the interruption flag is the stale tail of the
+      // interrupted response: the answer to the interrupting utterance cannot
+      // exist yet. Forwarding it under the freshly reserved generation ID
+      // would attribute obsolete text to the next turn.
+      ctx.modelPartsDroppedAfterInterrupt += modelTurn.parts.length;
+      ctx.modelChunksReceived += modelTurn.parts.filter((part) => part.inlineData?.data).length;
+      console.log(
+        `[Live WS] Dropped ${modelTurn.parts.length} content part(s) received with interruption [${ctx.id}]`
+      );
+    } else {
+      if (ctx.currentGenerationId === INITIAL_GENERATION_ID) {
+        nextGeneration(ctx);
       }
-      if (part.text) {
-        sendToClient(ctx, {
-          type: 'text',
-          sessionId: ctx.id,
-          generationId: ctx.currentGenerationId,
-          text: part.text,
-          serverMono: recvMono,
-          serverUtc: recvUtc,
-        });
+      const contentGenerationId = ctx.currentGenerationId;
+      frameGenerationId = contentGenerationId;
+      for (const part of modelTurn.parts) {
+        if (part.inlineData?.data) {
+          ctx.modelChunksReceived += 1;
+          // Strict no-audio-playback requirement for Sales Copilot:
+          // Do not forward generated audio payloads to the client.
+          ctx.modelChunksDropped += 1;
+          // Audio still counts as content: it identifies the response the
+          // server is producing even though this build never plays it.
+          ctx.lastContentGenerationId = contentGenerationId;
+        }
+        if (part.text) {
+          ctx.lastContentGenerationId = contentGenerationId;
+          sendToClient(ctx, {
+            type: 'text',
+            sessionId: ctx.id,
+            generationId: contentGenerationId,
+            text: part.text,
+            serverMono: recvMono,
+            serverUtc: recvUtc,
+          });
+        }
       }
     }
   }
 
-  // Stage D: turn complete. The generation counter always advances so a new
-  // response can never reuse the ID of a turn the client already closed.
+  // Stage D: turn complete.
+  //
+  // A trailing `turnComplete` after an interruption closes that interrupted
+  // turn and must not advance the counter a second time. A duplicated
+  // completion for a generation already closed must not advance at all.
   if (serverContent?.turnComplete) {
-    const completedGen = ctx.currentGenerationId;
-    ctx.completedTurnsCount += 1;
-    nextGeneration(ctx);
+    const completion = resolveTurnCompletion({
+      currentGenerationId: ctx.currentGenerationId,
+      currentHasContent: ctx.lastContentGenerationId === ctx.currentGenerationId,
+      interruptedGenerationId: ctx.interruptedGenerationId,
+      lastContentGenerationId: ctx.lastContentGenerationId,
+      alreadyClosedGenerationIds: [...ctx.closedGenerations],
+    });
+    if (completion.advanceGeneration) nextGeneration(ctx);
+    if (completion.advanceGeneration) ctx.completedTurnsCount += 1;
+    if (completion.advanceGeneration || completion.closesInterruptedTurn) {
+      ctx.closedGenerations.add(completion.completedGenerationId);
+    }
+    ctx.interruptedGenerationId = null;
+
     console.log(
-      `[Live WS] Turn complete [${ctx.id}] ${completedGen} -> ${ctx.currentGenerationId} ` +
-        `(turns=${ctx.completedTurnsCount}, audioDiscarded=${ctx.modelChunksDropped})`
+      `[Live WS] Turn complete [${ctx.id}] ${completion.completedGenerationId} -> ` +
+        `${ctx.currentGenerationId} (turns=${ctx.completedTurnsCount}, ` +
+        `audioDiscarded=${ctx.modelChunksDropped}` +
+        `${completion.closesInterruptedTurn ? ', closed interrupted turn' : ''}` +
+        `${completion.duplicate ? ', duplicate event' : ''})`
     );
     sendToClient(ctx, {
       type: 'turn_complete',
       sessionId: ctx.id,
-      completedGenerationId: completedGen,
+      completedGenerationId: completion.completedGenerationId,
       nextGenerationId: ctx.currentGenerationId,
       completedTurnsCount: ctx.completedTurnsCount,
+      closesInterruptedTurn: completion.closesInterruptedTurn,
+      duplicate: completion.duplicate,
       audioPacketsDiscarded: ctx.modelChunksDropped,
+      modelPartsDroppedAfterInterrupt: ctx.modelPartsDroppedAfterInterrupt,
       serverMono: recvMono,
       serverUtc: recvUtc,
     });
@@ -526,18 +604,28 @@ function handleServerMessage(
     });
   }
 
-  // 3. Private sales copilot suggestions: generated response text from Gemini
+  // 3. Private sales copilot suggestions: generated response text from Gemini.
+  //    The generation is captured before `turnComplete` advances the counter;
+  //    otherwise the last words of a suggestion would be tagged as the next
+  //    generation and could be promoted into a ghost recommendation.
   const outputTranscription = serverContent?.outputTranscription?.text;
   if (outputTranscription) {
-    sendToClient(ctx, {
-      type: 'transcription',
-      sessionId: ctx.id,
-      direction: 'output',
-      generationId: ctx.currentGenerationId,
-      text: outputTranscription,
-      serverMono: recvMono,
-      serverUtc: recvUtc,
-    });
+    if (interruptedInFrame) {
+      // Same stale tail as Stage B: never forward it under a new generation.
+      ctx.modelPartsDroppedAfterInterrupt += 1;
+      console.log(`[Live WS] Dropped output transcript received with interruption [${ctx.id}]`);
+    } else {
+      ctx.lastContentGenerationId = frameGenerationId;
+      sendToClient(ctx, {
+        type: 'transcription',
+        sessionId: ctx.id,
+        direction: 'output',
+        generationId: frameGenerationId,
+        text: outputTranscription,
+        serverMono: recvMono,
+        serverUtc: recvUtc,
+      });
+    }
   }
 
   // Stage F: voice activity signal if the server provides one

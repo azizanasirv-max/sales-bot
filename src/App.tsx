@@ -1027,6 +1027,22 @@ export default function App() {
               setCustomerInterim(null);
               if (res.added) {
                 logEvent('info', `Customer utterance finalized: "${msg.text}"`);
+                // A new customer turn supersedes any recommendation that is
+                // still streaming from an older generation: it must not keep
+                // looking active.
+                const retired = salesLedgerRef.current.retireStreamingBefore(
+                  gateRef.current.getActiveGenerationId()
+                );
+                if (retired.length) {
+                  setSalesSuggestions(salesLedgerRef.current.getAll());
+                  setLatestSuggestion(salesLedgerRef.current.getLatest());
+                  logEvent(
+                    'info',
+                    `Superseded obsolete streaming suggestion(s): ${retired
+                      .map((entry) => entry.generationId)
+                      .join(', ')}`
+                  );
+                }
                 if (userSpeechOnsetMonoRef.current) {
                   const custLatency = Math.round(msgRecvMono - userSpeechOnsetMonoRef.current);
                   setActiveSession((prev) =>
@@ -1046,7 +1062,21 @@ export default function App() {
             }
           } else if (msg.direction === 'output') {
             // Private Sales Copilot Suggestion (from Gemini outputAudioTranscription)
-            const genId = msg.generationId || gateRef.current.getActiveGenerationId();
+            const genId = msg.generationId as string | undefined;
+            if (!genId) {
+              // Never guess: unattributed text could belong to an older turn,
+              // and assigning it to the newest generation would fabricate a
+              // recommendation for the current one.
+              logEvent('error', 'Dropped output transcript without a generation id (unattributed).');
+              return;
+            }
+            if (gateRef.current.isInvalidated(genId)) {
+              logEvent(
+                'pipeline',
+                `Dropped suggestion text for interrupted generation ${genId} (stale)`
+              );
+              return;
+            }
             let latencyMs: number | undefined;
             if (userSpeechOnsetMonoRef.current) {
               latencyMs = Math.round(msgRecvMono - userSpeechOnsetMonoRef.current);
@@ -1056,6 +1086,13 @@ export default function App() {
               latencyMs,
               monoTime: msgRecvMono,
             });
+            if (res.isStale) {
+              logEvent(
+                'pipeline',
+                `Dropped late suggestion text for terminal generation ${genId}`
+              );
+              return;
+            }
             if (res.created) {
               logEvent('info', `New sales suggestion started [Gen: ${genId}]`);
               setActiveSession((prev) =>
@@ -1107,20 +1144,36 @@ export default function App() {
           );
           return;
         } else if (msg.type === 'interrupted') {
-          const interruptedGen =
-            msg.interruptedGenerationId || gateRef.current.getActiveGenerationId();
+          if (msg.duplicate) {
+            // A repeated interruption for a generation that was already
+            // retired is a no-op: no extra state transition, timing update or
+            // metric is allowed.
+            logEvent(
+              'info',
+              `Ignored duplicate interruption for ${msg.interruptedGenerationId ?? 'unknown generation'}`
+            );
+            return;
+          }
+          const interruptedGen = msg.interruptedGenerationId as string | undefined;
+          if (!interruptedGen) {
+            // Missing attribution must never be guessed into the newest
+            // generation: that would retire a suggestion the server never
+            // reported as interrupted.
+            logEvent('error', 'Ignored interruption without a generation id (unattributed).');
+            return;
+          }
           logEvent(
             'interrupted',
             `⚡ Gemini Live reported interruption of ${interruptedGen} (Stage 6–8)`
           );
 
           const interruptionResult = gateRef.current.handleInterruption(
-            msg.interruptedGenerationId,
+            interruptedGen,
             msg.nextGenerationId
           );
           cancelAllAssistantAudio(
             'server_interrupted',
-            msg.interruptedGenerationId,
+            interruptedGen,
             interruptionResult.invalidated
           );
           updateAppState('interrupted', 'Customer resumed speaking; suggestion updated');
@@ -1150,7 +1203,7 @@ export default function App() {
           );
 
           localCancellationFiredRef.current = false;
-          if (ledgerRef.current.interrupt(msg.interruptedGenerationId)) {
+          if (ledgerRef.current.interrupt(interruptedGen)) {
             setTurns(ledgerRef.current.snapshot());
           }
         } else if (msg.type === 'turn_complete') {
@@ -1158,12 +1211,17 @@ export default function App() {
           const nextGen = msg.nextGenerationId;
           const completedTurn = ledgerRef.current.get(completedGen);
           const wasInterrupted = completedTurn?.status === 'interrupted';
+          // A completion may only close a turn that is still responding; this
+          // makes duplicate completion frames idempotent.
+          const closedNow = ledgerRef.current.complete(completedGen);
 
           logEvent(
             'turn_complete',
             wasInterrupted
               ? `Turn closed after interruption (${completedGen})`
-              : `Sales suggestion turn completed cleanly (${completedGen})`
+              : msg.duplicate || !closedNow
+                ? `Duplicate/late completion ignored (${completedGen})`
+                : `Sales suggestion turn completed cleanly (${completedGen})`
           );
 
           const turnResult = gateRef.current.handleTurnComplete(completedGen, nextGen);
@@ -1178,7 +1236,8 @@ export default function App() {
             prev
               ? {
                   ...prev,
-                  completedTurns: prev.completedTurns + (wasInterrupted ? 0 : 1),
+                  completedTurns:
+                    prev.completedTurns + (closedNow && !wasInterrupted ? 1 : 0),
                   audioPacketsDiscardedServer:
                     msg.audioPacketsDiscarded !== undefined
                       ? msg.audioPacketsDiscarded
@@ -1187,24 +1246,33 @@ export default function App() {
               : null
           );
 
-          if (ledgerRef.current.complete(completedGen)) {
+          if (closedNow) {
             setTurns(ledgerRef.current.snapshot());
           }
           if (appStateRef.current === 'receiving_audio' || appStateRef.current === 'streaming_mic') {
             updateAppState('ready_for_conversation', 'Ready for next customer statement');
           }
         } else if (msg.type === 'text') {
-          const genId = msg.generationId || gateRef.current.getActiveGenerationId();
-          if (genId && gateRef.current.isInvalidated(genId)) {
+          const genId = msg.generationId as string | undefined;
+          if (!genId) {
+            logEvent('error', 'Dropped model text without a generation id (unattributed).');
+            return;
+          }
+          if (gateRef.current.isInvalidated(genId)) {
+            logEvent('pipeline', `Dropped model text for interrupted generation ${genId} (stale)`);
             return;
           }
           logEvent('audio_out', `Suggestion text from model: "${msg.text}"`);
           const res = salesLedgerRef.current.appendDelta(genId, msg.text, {
             monoTime: msgRecvMono,
           });
+          if (res.isStale) {
+            logEvent('pipeline', `Dropped late model text for terminal generation ${genId}`);
+            return;
+          }
           setSalesSuggestions(salesLedgerRef.current.getAll());
           setLatestSuggestion(salesLedgerRef.current.getLatest());
-          if (genId && ledgerRef.current.appendText(genId, msg.text)) {
+          if (ledgerRef.current.appendText(genId, msg.text)) {
             setTurns(ledgerRef.current.snapshot());
           }
         } else if (msg.type === 'usage') {
